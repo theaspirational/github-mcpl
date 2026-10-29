@@ -1285,17 +1285,17 @@ export class GitHubMcplServer {
    * as their `onEvent`, so one pipeline tags, renders and forwards whatever
    * arrived, however it arrived.
    */
-  readonly onEvent = (event: NormalizedEvent): Promise<void> => this.handleEvent(event);
+  readonly onEvent = (event: NormalizedEvent): Promise<boolean> => this.handleEvent(event);
 
-  private async handleEvent(event: NormalizedEvent): Promise<void> {
+  private async handleEvent(event: NormalizedEvent): Promise<boolean> {
     const conn = this.conn;
     // Plain MCP has no push and no channels: an event has nowhere to go.
-    if (!conn || !this.mcplEnabled) return;
+    if (!conn || !this.mcplEnabled) return false;
     // Nothing to do at all. Each egress is asked again at its own send, so
     // this is only the cheap way out of an event no path wants: see
     // {@link GitHubMcplServer.eventEgressAllowed} for why the answer here is
     // never the one the sends rely on.
-    if (!this.eventEgressAllowed(conn, 'push') && !this.eventEgressAllowed(conn, 'incoming')) return;
+    if (!this.eventEgressAllowed(conn, 'push') && !this.eventEgressAllowed(conn, 'incoming')) return false;
 
     let tags: string[];
     let metadata: EventMetadata;
@@ -1308,7 +1308,7 @@ export class GitHubMcplServer {
       content = renderEvent(event);
     } catch (err) {
       this.logger.error('event pipeline failed', { event: event.id, error: (err as Error).message });
-      return;
+      return false;
     }
 
     // A top-level comment that is *gone* is a removal, whoever removed it and
@@ -1353,10 +1353,15 @@ export class GitHubMcplServer {
     // A thread's channel first, so a host that has the channel sees the
     // message there before the push that also describes it. Asked here *and*
     // inside the registry, which is where the send finally happens.
+    let delivered = false;
+    let failed = false;
     if (event.thread && this.eventEgressAllowed(conn, 'incoming')) {
       try {
-        await this.registry().deliver(event, tags, metadata, content);
+        const outcome = await this.registry().deliver(event, tags, metadata, content);
+        delivered = outcome.delivered;
+        failed = !outcome.delivered;
       } catch (err) {
+        failed = true;
         this.logger.warn('channel delivery failed', { event: event.id, error: (err as Error).message });
       }
     }
@@ -1364,7 +1369,7 @@ export class GitHubMcplServer {
     // push/event for *every* event — including the ones with no thread (a
     // push, a repository-level change), which belong to no channel at all.
     // Re-asked after the channel delivery, which awaited the host.
-    if (!this.eventEgressAllowed(conn, 'push')) return;
+    if (!this.eventEgressAllowed(conn, 'push')) return delivered && !failed;
     const params: PushEventParams = {
       featureSet: EVENTS_FEATURE_SET,
       eventId: event.id,
@@ -1389,9 +1394,13 @@ export class GitHubMcplServer {
       payload: { content },
     };
     try {
-      await conn.sendRequest(method.PUSH_EVENT, params);
+      const result = await conn.sendRequest(method.PUSH_EVENT, params) as { accepted?: boolean } | undefined;
+      // A successful push must not hide a failed channel delivery: retrying
+      // can repeat the push, but must not permanently lose the channel event.
+      return result?.accepted !== false && !failed;
     } catch (err) {
       this.logger.warn('push/event failed', { event: event.id, error: (err as Error).message });
+      return false;
     }
   }
 

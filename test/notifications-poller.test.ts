@@ -14,6 +14,10 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { method } from '@animalabs/mcpl-core';
+import { Poller } from '../src/poller.js';
+import { GitHubMcplServer } from '../src/server.js';
+import { FakeGitHubApi, harness, initialize, grant } from './harness.js';
 import { NotificationsPoller, type NotificationsPollerApi } from '../src/notifications-poller.js';
 import { GithubState } from '../src/state.js';
 import { GitHubApiError, ReadCapError, type NotificationRow, type NotificationsPage, type OwnPull } from '../src/github-adapter.js';
@@ -1367,4 +1371,91 @@ test('a pass whose thread reads met GitHub\'s rate limit looks up no checks', as
   const result = await r.poller.pollOnce();
   assert.equal(result.checkLookups, 0);
   assert.ok(!r.github.calls.some((c) => c.startsWith('list own pulls')));
+});
+
+
+for (const unavailable of ['disconnected', 'plain-mcp', 'ungranted', 'channel-error', 'channel-refused', 'push-refused'] as const) {
+  test(`delivery receipt: ${unavailable} retains notification progress until a host accepts`, async (t) => {
+    const r = rig();
+    r.github.threads.set(channelId(ISSUE), threadRow(ISSUE));
+    r.github.comments.set(channelId(ISSUE), [comment(1, 7, '2026-10-15T00:09:30Z')]);
+    r.github.notify(ISSUE, '2026-10-15T00:09:30Z');
+    r.state.setNotificationsWatermark({ since: FIRST_W, lastModified: null, answeredAt: null });
+    const cursor = [FIRST_READ, '', '', ''].join('\u0000');
+    r.state.setPolledHead(`notif:${channelId(ISSUE)}`, cursor);
+    const api = new FakeGitHubApi();
+    api.seedIssue({ number: 7 });
+    const h = harness({ api, pushAccepted: unavailable !== 'push-refused' });
+    t.after(() => h.close());
+    let server = unavailable === 'disconnected'
+      ? new GitHubMcplServer(api, { botLogin: 'agent', repos: [REPO] })
+      : h.server;
+    if (unavailable !== 'disconnected') await initialize(h, unavailable !== 'plain-mcp');
+    if (unavailable.startsWith('channel-') || unavailable === 'push-refused') {
+      await grant(h);
+      if (unavailable.startsWith('channel-')) {
+        h.host.removeAllListeners('request');
+        h.host.on('request', (req) => {
+          if (req.method === method.CHANNELS_REGISTER || req.method === method.CHANNELS_CHANGED) {
+            const p = req.params as { channels?: { id: string }[]; updated?: { id: string }[] };
+            h.host.sendResponse(req.id, { results: (p.channels ?? p.updated ?? []).map((c) => ({ id: c.id, accepted: true })) });
+          } else if (req.method === method.CHANNELS_INCOMING) {
+            if (unavailable === 'channel-error') h.host.sendError(req.id, -32603, 'synthetic delivery failure');
+            else {
+              const p = req.params as { messages: { messageId: string }[] };
+              h.host.sendResponse(req.id, { results: p.messages.map((m) => ({ messageId: m.messageId, accepted: false })) });
+            }
+          } else h.host.sendResponse(req.id, { accepted: true });
+        });
+      }
+    }
+    const poller = new NotificationsPoller({ api: r.github, state: r.state, intervalMs: 60000, repos: [REPO], onEvent: (event) => server.onEvent(event), now: () => new Date(START) });
+    const first = await poller.pollOnce();
+    assert.equal(first.delivered.length, 0);
+    assert.equal(first.failed, 1);
+    assert.deepEqual(r.state.snapshot().pollKeys, []);
+    assert.equal(r.state.polledHead(`notif:${channelId(ISSUE)}`), cursor);
+    assert.equal(r.state.notificationsWatermark().since, FIRST_W);
+    assert.equal(r.state.notificationsWatermark().answeredAt, null);
+    assert.equal(r.state.notificationRetries().length, 1);
+
+    const ready = harness({ api });
+    t.after(() => ready.close());
+    await initialize(ready, true);
+    await grant(ready);
+    server = ready.server;
+    const second = await poller.pollOnce();
+    assert.equal(second.failed, 0);
+    assert.equal(second.delivered.length, 1);
+    assert.ok(r.state.snapshot().pollKeys.includes('issue_comment:1:2026-10-15T00:09:30Z'));
+    assert.equal(r.state.notificationRetries().length, 0);
+    assert.notEqual(r.state.polledHead(`notif:${channelId(ISSUE)}`), cursor);
+    assert.ok(ready.hostSaw.some((req) => req.method === method.CHANNELS_INCOMING));
+  });
+}
+
+test('delivery receipt: a false checks delivery is not deduplicated or settled', async () => {
+  const r = rig();
+  r.github.ownPulls = [{ repo: REPO, number: 12, updatedAt: FIRST_W, html_url: 'https://example.invalid/pull/12' }];
+  r.github.heads.set(channelId(PULL), 'synthetic-head');
+  r.github.checks.set('synthetic-head', { sha: 'synthetic-head', conclusion: 'success', total: 1, failed: [] });
+  let accepted = false;
+  const poller = new NotificationsPoller({ api: r.github, state: r.state, intervalMs: 60000, repos: [REPO], login: 'agent', onEvent: () => accepted, now: () => new Date(START) });
+  assert.deepEqual((await poller.pollOnce()).delivered, []);
+  assert.deepEqual(r.state.snapshot().pollKeys, []);
+  accepted = true;
+  assert.equal((await poller.pollOnce()).delivered.length, 1);
+});
+
+
+test('delivery receipt: App repository polling retains its legacy handoff behavior', async () => {
+  const api = new FakeGitHubApi();
+  api.seedIssue({ number: 7, createdAt: '2026-10-15T00:09:30Z', updatedAt: '2026-10-15T00:09:30Z' });
+  const server = new GitHubMcplServer(api, { botLogin: 'agent', repos: [REPO] });
+  const state = GithubState.empty();
+  state.setLastPollAt(FIRST_W);
+  const poller = new Poller({ api, state, repos: [REPO], intervalMs: 60000, onEvent: server.onEvent, now: () => new Date(START) });
+  await poller.pollOnce();
+  // App ingress still ignores the receipt, as before this contributor-only fix.
+  assert.ok(state.snapshot().pollKeys.length > 0);
 });

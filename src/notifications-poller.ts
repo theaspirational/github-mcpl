@@ -67,8 +67,8 @@
  *     keys it, so a row a pass reads twice is delivered once.
  *
  * **Failures.** Delivered means handed to `onEvent`, the server's event
- * pipeline, which decides what becomes of an event, as for every ingress: it
- * drops one with no host to send it to, without throwing. A thread's cursor
+ * pipeline. An explicit false receipt (including no eligible host), like a
+ * thrown failure, leaves the event unrecorded for another pass. A thread's cursor
  * moves past rows only once each was delivered, and past a state change only
  * once it was. A thread whose read failed, or one of whose events `onEvent`
  * threw on, goes on the retry list, which keeps its cursor too, and is
@@ -543,6 +543,7 @@ export class NotificationsPoller {
     // The dedup ring as it stands, copied once a pass; each delivery adds its key.
     const alreadySeen = new Set(this.state.snapshot().pollKeys);
     let rateLimited = 0;
+    let deliveryFailed = false;
     for (const [channel, thread] of toRead) {
       const waiting = retries.get(channel);
       const attemptsSoFar = waiting?.attempts ?? 0;
@@ -554,6 +555,7 @@ export class NotificationsPoller {
         continue;
       }
       const outcome = await this.pollThread(thread, reachFrom, receivedAt, alreadySeen, waiting?.cursor ?? null, request);
+      deliveryFailed ||= outcome.deliveryFailed === true;
       result.delivered.push(...outcome.delivered);
       result.duplicates += outcome.duplicates;
       if (outcome.failure === null) {
@@ -593,6 +595,7 @@ export class NotificationsPoller {
       });
     } else {
       const checks = await this.pollOwnChecks(receivedAt, alreadySeen);
+      deliveryFailed ||= checks.deliveryFailed;
       result.delivered.push(...checks.delivered);
       result.duplicates += checks.duplicates;
       result.checkLookups = checks.lookups;
@@ -608,7 +611,9 @@ export class NotificationsPoller {
     }
     // W moves only on what a listing showed; a 304 leaves it, and records when GitHub answered.
     const answered = ms(page.date);
-    this.state.setNotificationsWatermark({
+    // A failed handoff is not progress, even though the inbox listing worked.
+    // Preserve the reach-back anchor as well as W while the retry is pending.
+    this.state.setNotificationsWatermark(deliveryFailed ? { since, lastModified, answeredAt } : {
       since: next,
       lastModified: page.notModified ? lastModified : conditional(page),
       answeredAt: isoSeconds(Number.isFinite(answered) ? answered : ms(receivedAt)),
@@ -634,6 +639,7 @@ export class NotificationsPoller {
   ): Promise<{
     delivered: NormalizedEvent[];
     duplicates: number;
+    deliveryFailed?: boolean;
     failure: ThreadFailure | null;
     /** The review request still to deliver, when it wasn't. */
     request?: { id: string; updatedAt: string };
@@ -663,7 +669,7 @@ export class NotificationsPoller {
           continue;
         }
         try {
-          await this.onEvent(event);
+          await this.deliver(event);
         } catch (err) {
           refusal = err instanceof Error ? err.message : String(err);
           this.logger.warn('notifications poll: event delivery failed; its key stays unrecorded for the next pass', { key, error: refusal });
@@ -717,23 +723,28 @@ export class NotificationsPoller {
     // nor holds the cursor: one refused waits on the retry entry instead.
     const requestRefused = await deliver(requestEvent(read.row));
 
-    const through = rowsRefused === null && stateRefused === null;
+    const failure = rowsRefused ?? stateRefused ?? requestRefused;
+    const through = failure === null;
     // The rows the next read takes again, from a second before its since: every
     // one of them was delivered now or before, once this read got through.
     const edgeFrom = ms(read.row.updatedAt) - 1000;
+    // A delivered state change remains known even if a comment beside it
+    // failed; otherwise a later update could announce the same close again.
+    // Only a complete handoff advances the read cursor (since) and its edge.
+    const stateDelivered = through || (read.state !== null && stateRefused === null);
     this.state.setPolledHead(
       cursorKey,
       packCursor({
         since: through ? read.row.updatedAt : (cursor.since ?? since),
-        seen: stateRefused === null ? read.row.updatedAt : cursor.seen,
-        marker: stateRefused === null ? polledMarker(read.row) : cursor.marker,
+        seen: stateDelivered ? read.row.updatedAt : cursor.seen,
+        marker: stateDelivered ? polledMarker(read.row) : cursor.marker,
         edge: through ? read.rows.filter((row) => ms(row.at) >= edgeFrom).map((row) => ringKey(row.event)) : cursor.edge,
       }),
     );
-    const failure = rowsRefused ?? stateRefused ?? requestRefused;
     return {
       delivered,
       duplicates,
+      deliveryFailed: !through,
       failure: failure === null ? null : { kind: 'failed', cause: `the host refused one of its events (${failure})` },
       ...(request && requestRefused !== null ? { request } : {}),
     };
@@ -760,8 +771,8 @@ export class NotificationsPoller {
   private async pollOwnChecks(
     receivedAt: string,
     alreadySeen: Set<string>,
-  ): Promise<{ delivered: NormalizedEvent[]; duplicates: number; lookups: number }> {
-    const out = { delivered: [] as NormalizedEvent[], duplicates: 0, lookups: 0 };
+  ): Promise<{ delivered: NormalizedEvent[]; duplicates: number; lookups: number; deliveryFailed: boolean }> {
+    const out = { delivered: [] as NormalizedEvent[], duplicates: 0, lookups: 0, deliveryFailed: false };
     if (!this.login) return out;
     let pulls: OwnPull[];
     try {
@@ -831,8 +842,9 @@ export class NotificationsPoller {
         continue;
       }
       try {
-        await this.onEvent(event);
+        await this.deliver(event);
       } catch (err) {
+        out.deliveryFailed = true;
         this.logger.warn('notifications: a checks event was refused; it is delivered when its pull request\'s turn comes again', {
           key,
           error: err instanceof Error ? err.message : String(err),
@@ -914,12 +926,15 @@ export class NotificationsPoller {
     return place;
   }
 
+  /** Void listeners keep their legacy accepted-handoff contract; false is not success. */
+  private async deliver(event: NormalizedEvent): Promise<void> {
+    if (await this.onEvent(event) === false) throw new Error('no host egress accepted the complete event');
+  }
+
   /**
    * Tell the agent, on the thread's own channel, that the poller stopped
-   * reading a thread, and why. The server's own event handler doesn't throw:
-   * it drops an event with no host to send it to, and catches its own build
-   * and send failures. So a refusal here comes from a listener that throws,
-   * and it's logged; nothing else carries it.
+   * reading a thread, and why. A thrown failure or a false delivery receipt
+   * is logged; nothing else carries a refused drop notice.
    */
   private async announceDrop(thread: ThreadRef, failure: ThreadFailure, attempts: number, receivedAt: string): Promise<NormalizedEvent[]> {
     const channel = channelId(thread);
@@ -945,7 +960,7 @@ export class NotificationsPoller {
     if (failure.kind === 'backlog') this.logger.warn('notifications: skipped a thread\'s backlog; it is read from its latest update on', { channel });
     else this.logger.error('notifications: stopped reading a thread until it next moves', { channel, attempts, error: failure.cause });
     try {
-      await this.onEvent(event);
+      await this.deliver(event);
       return [event];
     } catch (err) {
       this.logger.error('notifications: the event announcing a dropped thread was refused', {

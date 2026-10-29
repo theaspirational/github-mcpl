@@ -51,7 +51,10 @@ const DELIVERY_HEADER = 'x-github-delivery';
 const EVENT_HEADER = 'x-github-event';
 
 /** What the ingress hands a normalized event to (.9 wires the pipeline). */
-export type EventListener = (event: NormalizedEvent) => void | Promise<void>;
+/** False explicitly reports non-delivery. Legacy App ingress ignores the receipt;
+ * the notifications poller uses it to retain its cursor and retry. Void remains
+ * an accepted handoff for existing listeners. */
+export type EventListener = (event: NormalizedEvent) => void | boolean | Promise<void | boolean>;
 
 export interface WebhookListenerOptions {
   /** GITHUB_WEBHOOK_SECRET_FILE's contents. Secret: never logged. */
