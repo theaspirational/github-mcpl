@@ -15,8 +15,9 @@
  * so nothing depends on what anyone has marked read, and this ingress marks
  * nothing read. Threads in a repository outside GITHUB_REPOS are dropped: no
  * tool and no `channels/publish` would act there, and a user's other threads
- * would only reach the agent's context for nothing. W moves on with every
- * listing that got through, whatever became of the threads it listed.
+ * would only reach the agent's context for nothing. W moves on after a
+ * complete listing whose event deliveries succeeded; a capped listing keeps
+ * the original window and is read unconditionally again.
  *
  * **What it reads of a thread.** Each listed thread, and each thread a past
  * pass failed on, is read since its own cursor, every page: its conversation
@@ -601,11 +602,13 @@ export class NotificationsPoller {
       result.checkLookups = checks.lookups;
     }
 
-    const next = page.notModified ? since : nextWatermark(page, since);
+    // A capped prefix proves nothing about the timestamps of omitted rows.
+    // Keep the entire window rather than assuming an ascending listing order.
+    const next = page.notModified || page.truncated ? since : nextWatermark(page, since);
     if (page.truncated) {
-      this.logger.error('notifications: the listing stopped at its page cap, so some threads GitHub notified between since and until may not have been listed or read', {
+      this.logger.error('notifications: the listing stopped at its page cap; retaining the window for an unconditional retry', {
         since,
-        until: next,
+        until: nextWatermark(page, since),
         listed: page.notifications.length,
       });
     }
@@ -613,7 +616,13 @@ export class NotificationsPoller {
     const answered = ms(page.date);
     // A failed handoff is not progress, even though the inbox listing worked.
     // Preserve the reach-back anchor as well as W while the retry is pending.
-    this.state.setNotificationsWatermark(deliveryFailed ? { since, lastModified, answeredAt } : {
+    // A conditional 304 cannot complete a truncated listing. Its reach-back
+    // anchor must also stand, so an older omitted thread can still be read.
+    this.state.setNotificationsWatermark(deliveryFailed || page.truncated ? {
+      since,
+      lastModified: page.truncated ? null : lastModified,
+      answeredAt,
+    } : {
       since: next,
       lastModified: page.notModified ? lastModified : conditional(page),
       answeredAt: isoSeconds(Number.isFinite(answered) ? answered : ms(receivedAt)),

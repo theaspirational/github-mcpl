@@ -252,18 +252,20 @@ test('W rests only on stamps a listing showed: an empty listing without Last-Mod
   assert.equal(r.state.notificationsWatermark().since, FIRST_W, 'never back before the W it listed from');
 });
 
-test('a listing stopped at its page cap still moves W, and the log names the window', async () => {
+test('truncated listing: the page cap holds W, and the log names the retained window', async () => {
   const r = rig();
   r.github.truncated = true;
   const result = await r.poller.pollOnce();
   assert.equal(result.truncated, true);
-  assert.equal(r.state.notificationsWatermark().since, '2026-10-15T00:09:39Z');
+  assert.equal(r.state.notificationsWatermark().since, FIRST_W);
+  assert.equal(r.state.notificationsWatermark().lastModified, null);
+  assert.equal(r.state.notificationsWatermark().answeredAt, null);
   assert.ok(r.logs.some((line) => line.startsWith('error') && line.includes('page cap') && line.includes(FIRST_W)));
 
-  // The log names the window W moves over: up to the next W.
+  // The log names the retained window, even when a later listing moves its upper bound.
   r.github.lastModified = 'Wed, 15 Oct 2026 00:09:50 GMT';
   await r.poller.pollOnce();
-  assert.ok(r.logs.some((line) => line.includes('page cap') && line.includes('"since":"2026-10-15T00:09:39Z","until":"2026-10-15T00:09:49Z"')));
+  assert.ok(r.logs.some((line) => line.includes('page cap') && line.includes('"since":"2026-10-15T00:09:00Z","until":"2026-10-15T00:09:49Z"')));
 });
 
 test('X-Poll-Interval sets the interval on a 304 too, and a later, shorter one lowers it', async () => {
@@ -1458,4 +1460,33 @@ test('delivery receipt: App repository polling retains its legacy handoff behavi
   await poller.pollOnce();
   // App ingress still ignores the receipt, as before this contributor-only fix.
   assert.ok(state.snapshot().pollKeys.length > 0);
+});
+
+
+test('truncated listing: restart re-reads the original window without a conditional 304 or duplicate delivery', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'gh-notif-truncated-')), 'state.json');
+  const r = rig({ stateFile: file });
+  const older: ThreadRef = { repo: REPO, number: 8, kind: 'issue' };
+  for (const [thread, stamp] of [[ISSUE, '2026-10-15T00:09:30Z'], [older, '2026-10-15T00:09:10Z']] as const) {
+    r.github.threads.set(channelId(thread), threadRow(thread, { updatedAt: stamp }));
+    r.github.comments.set(channelId(thread), [comment(thread.number, thread.number, stamp)]);
+  }
+  // The capped response contains a newer thread, not necessarily the oldest
+  // one in the window. Never infer a safe cutoff from the returned prefix.
+  r.github.notify(ISSUE, '2026-10-15T00:09:30Z');
+  r.github.truncated = true;
+  assert.equal((await r.poller.pollOnce()).delivered.length, 1);
+  assert.equal(r.state.notificationsWatermark().since, FIRST_W);
+  assert.equal(r.state.notificationsWatermark().lastModified, null);
+
+  r.github.notify(older, '2026-10-15T00:09:10Z');
+  r.github.truncated = false;
+  // Last-Modified did not change: retaining it would yield 304 here.
+  const restarted = rig({ stateFile: file, github: r.github });
+  const second = await restarted.poller.pollOnce();
+  assert.equal(second.notModified, false);
+  assert.deepEqual(second.delivered.map((e) => e.thread?.number), [8]);
+  assert.equal(second.duplicates, 1);
+  assert.ok(r.github.calls.filter((call) => call.startsWith('list ')).every((call) => call === `list since=${FIRST_W} ims=null`));
+  assert.equal(restarted.state.notificationsWatermark().since, '2026-10-15T00:09:39Z');
 });
