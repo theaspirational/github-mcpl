@@ -2807,17 +2807,19 @@ test('token authorization is not forwarded by fetch to a different redirect orig
 });
 
 
-for (const last of ['100000', '9'.repeat(400)]) {
-  test(`bounded review paging: an empty last page stops the read (${last.length > 10 ? 'overflow' : last})`, async () => {
+for (const last of ['2', '3', '100000', '9'.repeat(400)]) {
+  test(`empty review tail: page one is preserved or capped (${last.length > 10 ? 'overflow' : last})`, async () => {
     const r = await tokenRig((fake) => {
       fake.on('GET /repos/anima-research/rayforce/pulls/12/reviews', (req, nth): Answer => {
-        // Abort the unfixed implementation in the fixture, not after thousands
-        // of requests. A passing read never reaches this synthetic failure.
         if (nth > 3) return { status: 422, body: { message: 'synthetic request budget exceeded' } };
-        return { body: [], headers: Number(req.query.page) === 1 ? { link: `<https://api.github.com/reviews?page=${last}>; rel="last"` } : {} };
+        return Number(req.query.page) === 1
+          ? { body: reviewRows(1, '2026-10-15T00:00:00Z', 1), headers: { link: `<https://api.github.com/reviews?page=${last}>; rel="last"` } }
+          : { body: [] };
       });
     });
-    assert.deepEqual(await r.adapter.listReviewsSince(PULL, '2026-10-14T00:00:00Z'), []);
+    const read = () => r.adapter.listReviewsSince(PULL, '2026-10-14T00:00:00Z');
+    if (Number(last) <= 3) assert.equal((await read()).length, 1, 'page one still holds a new review');
+    else await assert.rejects(read, ReadCapError, 'page one still applies its read-cap check');
     assert.deepEqual(r.fake.for('GET /repos/anima-research/rayforce/pulls/12/reviews').map((call) => call.query.page), ['1', String(Math.min(Number(last), Number.MAX_SAFE_INTEGER))]);
   });
 }

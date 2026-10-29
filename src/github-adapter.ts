@@ -1757,7 +1757,12 @@ export class GitHubAdapter implements GitHubApi {
     let page = last;
     while (page > 1) {
       const batch = (await read(page)).rows;
-      if (batch.length === 0) break;
+      if (batch.length === 0) {
+        // A shrinking tail does not make the already-read first page empty.
+        // Fall through to its normal inclusion and read-cap check below.
+        page = 1;
+        break;
+      }
       const reachedOlder = batch.some((row) => submitted(row) < sinceMs);
       // An older-only boundary page may end the read; new rows beyond the
       // cap may not. Unparseable timestamps cannot buy an unbounded walk.
