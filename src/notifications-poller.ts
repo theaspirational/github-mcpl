@@ -604,6 +604,8 @@ export class NotificationsPoller {
 
     // A capped prefix proves nothing about the timestamps of omitted rows.
     // Keep the entire window rather than assuming an ascending listing order.
+    // A persistently full 1,000-thread window may repeat without reaching its
+    // tail; log every truncated pass rather than claiming complete catch-up.
     const next = page.notModified || page.truncated ? since : nextWatermark(page, since);
     if (page.truncated) {
       this.logger.error('notifications: the listing stopped at its page cap; retaining the window for an unconditional retry', {
@@ -728,8 +730,8 @@ export class NotificationsPoller {
     read.rows.sort((a, b) => (a.at === b.at ? a.event.id.localeCompare(b.event.id) : ms(a.at) - ms(b.at)));
     const rowsRefused = await deliver(read.rows);
     const stateRefused = read.state ? await deliver([read.state]) : null;
-    // A review request comes with no row of the thread's, so it neither moves
-    // nor holds the cursor: one refused waits on the retry entry instead.
+    // A review request has no thread row of its own. A refused request stays
+    // on the retry entry and holds the read cursor like any failed handoff.
     const requestRefused = await deliver(requestEvent(read.row));
 
     const failure = rowsRefused ?? stateRefused ?? requestRefused;
