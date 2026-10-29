@@ -1354,14 +1354,12 @@ export class GitHubMcplServer {
     // message there before the push that also describes it. Asked here *and*
     // inside the registry, which is where the send finally happens.
     let delivered = false;
-    let failed = false;
     if (event.thread && this.eventEgressAllowed(conn, 'incoming')) {
       try {
         const outcome = await this.registry().deliver(event, tags, metadata, content);
         delivered = outcome.delivered;
-        failed = !outcome.delivered;
+        if (!outcome.delivered) this.logger.warn('channel delivery declined', { event: event.id, reason: outcome.reason });
       } catch (err) {
-        failed = true;
         this.logger.warn('channel delivery failed', { event: event.id, error: (err as Error).message });
       }
     }
@@ -1369,7 +1367,7 @@ export class GitHubMcplServer {
     // push/event for *every* event — including the ones with no thread (a
     // push, a repository-level change), which belong to no channel at all.
     // Re-asked after the channel delivery, which awaited the host.
-    if (!this.eventEgressAllowed(conn, 'push')) return delivered && !failed;
+    if (!this.eventEgressAllowed(conn, 'push')) return delivered;
     const params: PushEventParams = {
       featureSet: EVENTS_FEATURE_SET,
       eventId: event.id,
@@ -1395,12 +1393,13 @@ export class GitHubMcplServer {
     };
     try {
       const result = await conn.sendRequest(method.PUSH_EVENT, params) as { accepted?: boolean } | undefined;
-      // A successful push must not hide a failed channel delivery: retrying
-      // can repeat the push, but must not permanently lose the channel event.
-      return result?.accepted !== false && !failed;
+      // Either granted egress accepting is delivery. A declined sibling must
+      // not make the notifications poller re-send an already accepted event.
+      if (result?.accepted === false) this.logger.warn('push/event declined', { event: event.id });
+      return delivered || result?.accepted !== false;
     } catch (err) {
       this.logger.warn('push/event failed', { event: event.id, error: (err as Error).message });
-      return false;
+      return delivered;
     }
   }
 

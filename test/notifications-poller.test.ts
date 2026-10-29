@@ -1394,7 +1394,7 @@ for (const unavailable of ['disconnected', 'plain-mcp', 'ungranted', 'channel-er
       : h.server;
     if (unavailable !== 'disconnected') await initialize(h, unavailable !== 'plain-mcp');
     if (unavailable.startsWith('channel-') || unavailable === 'push-refused') {
-      await grant(h);
+      await grant(h, unavailable === 'push-refused' ? ['pushEvents'] : ['channels.register', 'channels.incoming']);
       if (unavailable.startsWith('channel-')) {
         h.host.removeAllListeners('request');
         h.host.on('request', (req) => {
@@ -1490,3 +1490,39 @@ test('truncated listing: restart re-reads the original window without a conditio
   assert.ok(r.github.calls.filter((call) => call.startsWith('list ')).every((call) => call === `list since=${FIRST_W} ims=null`));
   assert.equal(restarted.state.notificationsWatermark().since, '2026-10-15T00:09:39Z');
 });
+
+for (const accepted of ['channel', 'push'] as const) {
+  test(`partial egress receipt: ${accepted} acceptance is delivered once despite the other refusal`, async (t) => {
+    const r = rig();
+    r.github.threads.set(channelId(ISSUE), threadRow(ISSUE));
+    r.github.comments.set(channelId(ISSUE), [comment(1, 7, '2026-10-15T00:09:30Z')]);
+    r.github.notify(ISSUE, '2026-10-15T00:09:30Z');
+    r.github.conditional = false;
+    r.github.lastModified = 'Wed, 15 Oct 2026 00:09:30 GMT';
+    const api = new FakeGitHubApi();
+    api.seedIssue({ number: 7 });
+    const warnings: string[] = [];
+    const h = harness({ api, logger: { debug() {}, info() {}, error() {}, warn(message) { warnings.push(message); } } });
+    t.after(() => h.close());
+    await initialize(h, true);
+    await grant(h);
+    let incoming = 0;
+    h.host.removeAllListeners('request');
+    h.host.on('request', (req) => {
+      if (req.method === method.CHANNELS_REGISTER || req.method === method.CHANNELS_CHANGED) {
+        const p = req.params as { channels?: { id: string }[]; updated?: { id: string }[] };
+        h.host.sendResponse(req.id, { results: (p.channels ?? p.updated ?? []).map((c) => ({ id: c.id, accepted: true })) });
+      } else if (req.method === method.CHANNELS_INCOMING) {
+        incoming += 1;
+        const p = req.params as { messages: { messageId: string }[] };
+        h.host.sendResponse(req.id, { results: p.messages.map((m) => ({ messageId: m.messageId, accepted: accepted === 'channel' })) });
+      } else h.host.sendResponse(req.id, { accepted: accepted === 'push' });
+    });
+    const poller = new NotificationsPoller({ api: r.github, state: r.state, intervalMs: 60000, repos: [REPO], onEvent: h.server.onEvent, now: () => new Date(START) });
+    assert.equal((await poller.pollOnce()).delivered.length, 1);
+    assert.ok(r.state.snapshot().pollKeys.includes('issue_comment:1:2026-10-15T00:09:30Z'));
+    assert.equal((await poller.pollOnce()).delivered.length, 0);
+    assert.equal(incoming, 1, 'an accepted egress is not resent because the other declined');
+    assert.ok(warnings.some((message) => message.includes('declined')));
+  });
+}
