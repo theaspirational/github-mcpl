@@ -331,6 +331,18 @@ test('search_issues bounds the limit to the rendered list bound', async () => {
   assert.deepEqual(api.callsTo('searchIssues')[0].args, [TEST_REPO, 'flaky', LIMITS.listEntries]);
 });
 
+test('search_issues says how many results from other repositories it left out', async () => {
+  const api = new FakeGitHubApi();
+  api.seedIssue({ number: 7, title: 'flaky test' });
+  api.searchOutside = 2;
+  const out = ok(await readToolModule.call('search_issues', { query: 'flaky' }, ctx(api)));
+  assert.match(out, /1 match in anima-research\/rayforce for "flaky"/);
+  assert.match(out, /2 results on this page from other repositories left out: a search stays inside anima-research\/rayforce/);
+  api.seedIssue({ number: 8, title: 'other' });
+  const none = ok(await readToolModule.call('search_issues', { query: 'nothing here' }, ctx(api)));
+  assert.match(none, /no matches in anima-research\/rayforce for "nothing here"\n2 results on this page from other repositories left out/);
+});
+
 test('search_issues says so when nothing matches', async () => {
   const api = new FakeGitHubApi();
   const out = ok(await readToolModule.call('search_issues', { query: 'nothing' }, ctx(api)));

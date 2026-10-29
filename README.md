@@ -3,8 +3,10 @@
 An MCPL connector for GitHub. A repository's issues, pull requests,
 comments, reviews and check results reach an agent as **push events** and as
 **channels**, and the agent acts back through **tools** grouped into feature
-sets the host grants (and can roll back). One server serves one repository
-or several of one owner; one process per owner.
+sets the host grants (and can roll back). With the App, one server serves
+one repository or several of one owner, so one process per owner; with a
+user token ([contributor mode](#contributor-mode-user-token)), one serves
+the repositories it works in, whoever owns them.
 
 - **Wake, not poll-and-hope.** An issue, a comment, a pull request, a review,
   an inline review comment or a failing check suite becomes one normalized
@@ -291,7 +293,7 @@ exception next, and the wake rules last:
 | --- | --- | --- | --- |
 | 1 | `github-self` | `fromSelf` | `skip` — otherwise the agent answers itself |
 | 2 | `github-machine-noise` | `github:push`, `github:ci=success` | `skip` |
-| 3 | `github-other-bots` | `chat:from-bot`, without `chat:mention` or `github:ci=failure` | `skip` — dependabot does not get a turn |
+| 3 | `github-other-bots` | `chat:from-bot`, without `chat:mention`, `github:pr=review_requested` or `github:ci=failure` | `skip` — dependabot does not get a turn, though a review asked of the agent on its pull request does |
 | 4 | `github-ci-failure-own-thread` | `github:ci=failure` **and** `isOwnThread` | `always` — the exception rules 2 and 3 leave room for |
 | 5 | `github-direct-address` | `mentioned`, `isReviewRequested`, `isOwnThread`, `isReplyToSelf` | `always` |
 | 6 | `github-new-work` (maintainer clone only) | `github:issue=opened`, `github:pr=opened` | `debounce: 60000` — one wake once the burst settles |
@@ -302,6 +304,38 @@ exception next, and the wake rules last:
 own pull request is skipped, a broken one wakes it, a bot's pull request
 neither wakes nor debounces, a human mention wakes it, and no rule is left
 unreachable by an earlier one.
+
+## Contributor mode (user token)
+
+For a resident that contributes to repositories it **cannot install the App on**, such as someone else's upstream: it wakes on reviews, comments and state changes on its own pull requests and on the threads it takes part in.
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `GITHUB_TOKEN_FILE` | yes (instead of the App variables) | — | Path to a personal access token (classic), mode 600. See **The token** below. |
+| `GITHUB_BOT_LOGIN` | no | the token's login | The token owner's login, spelled as GitHub spells it (no `[bot]`). From-self and mention detection use it. Unset, the server takes it from `GET /user` at start, and stops when GitHub doesn't answer. Set, it is checked against the token's own login when GitHub answers, and the server stops if they differ; when GitHub doesn't answer, it starts unchecked and logs a warning. |
+| `GITHUB_REPOS` | yes | — | The repositories the agent works in, and the write allow-list. In this mode it may span several owners. Notifications from any other repository are dropped. Spell each as GitHub does: at start the server checks each against GitHub and stops on a different spelling, or a repository the token can't see. |
+| `GITHUB_POLL_INTERVAL_MS` | no | `60000` | Notifications poll interval; values below `60000` are refused. GitHub's `X-Poll-Interval` is honoured when it asks for longer. |
+| `GITHUB_STATE_FILE` | recommended | — | Keeps the notifications watermark, when GitHub last answered, each thread's cursor, the threads to read again and the dedup ring across restarts. Without it, every start begins as a first start does (below): activity from a longer downtime isn't delivered, and some from before the start can arrive twice. |
+
+Setting both `GITHUB_TOKEN_FILE` and the App variables is a startup error, and so is `GITHUB_APP_INSTALLATION_ID`. `GITHUB_WEBHOOK_PORT` is refused in this mode: GitHub doesn't send webhooks for repositories you don't administer.
+
+**The token.** GitHub serves the notifications endpoints to a personal access token (classic) only; a fine-grained token can't read them. Give it the narrowest scopes that work: `notifications`, plus `public_repo` when the repositories are public. `repo` is full read and write access to every private repository the account can reach, so use it only when a private repository needs it.
+
+**The account.** Use an account the agent alone posts from, such as a machine account. GitHub shows the agent's comments, reviews and pull requests as that account's, and this server treats everything that account does as the agent's own: its own events are tagged from-self and don't wake it, and the comment tools let it edit and delete that account's comments.
+
+**How events get in.** The server lists `GET /notifications?all=true&participating=true&since=…` from where the last listing got to, with `If-Modified-Since`, so an idle inbox's listing is a `304` that doesn't count against the rate limit. Read and unread threads are listed alike, and nothing is marked read. For each listed issue or pull request in `GITHUB_REPOS`, it reads what is new since its last read: comments, a pull request's review comments and submitted reviews, and its state. Each becomes the same `push/event` and `channels/incoming`, with the same tags and metadata, as in App mode. A thread opened since the last pass arrives as opened, a close or merge as closed (a merge tagged `github:pr=merged` too), with whoever closed or merged it as the actor, and an edit to an issue as edited, attributed to whoever opened it, since GitHub's row doesn't say who edited it; a thread opened and closed between two passes arrives as closed. An edit to a closed issue or pull request arrives as nothing. A reopened issue arrives as edited, as with App mode's repository poll, and a reopened pull request as nothing, as with a webhook delivery. A listed pull request whose notification gives `review_requested` as its reason arrives as `pull.review_requested` too, with the pull request's author as the actor, since the notification doesn't say who asked. It arrives once for each update of the notification listed with that reason, so if GitHub keeps the reason while the thread moves on, a later update, a comment for one, brings it again. Each pass also looks up the checks on the heads of the open pull requests the token's user authored in `GITHUB_REPOS`, the 100 most recently updated, 20 a pass and in turns past that, and a head whose checks have all finished arrives as `checks.completed`, as in App mode, once for each conclusion and set of failed jobs. Once a head's result has arrived with every run finished, it isn't looked up again until its pull request is updated or ten minutes have passed since its head was read, so a re-run on the same head is seen on the first look after that, a pass or so past ten minutes. A head with no check runs two minutes after it was read is left the same way, so runs created later than that arrive with the next look. A failure that arrives while other runs go is looked up each pass until they finish. The tools' `search_issues` searches one repository in `GITHUB_REPOS`: it drops `repo:`, `user:`, `org:` and `owner:` qualifiers from the query, and leaves out, and counts, any result on the page from another repository.
+
+**What a pass costs.** The listing, one request a page of 50 threads, free when it's a `304`. One search for the token user's open pull requests, on the search API's own limit of 30 a minute, which the tools' `search_issues` shares, on every pass whose thread reads met no rate limit, a `304`'s included. Then for each of them not left as above, up to 20 a pass and in turns past that, one check-runs request, more past 100 runs, and one more for its head when it moved since the last pass or that read is ten minutes old. With 20 open pull requests whose checks have finished and nothing moving, that's about 240 requests an hour, besides the 60 searches. Then, for each thread it lists or that waits, two requests for an issue (its row and its comments) and four for a pull request (its row, its comments, its review comments and its reviews), each list taking more when its new rows run past a page, and the reviews one more once a pull request has more than 100 reviews. The first time the server handles an event on a thread after it starts, its event pipeline also reads the thread itself (for a pull request, with its head's check runs), its comments and a pull request's review threads, to learn whether the agent took part there, as in App mode. The agent's own tool calls draw on the same 5,000 an hour.
+
+**When a thread can't be read.** A thread whose read fails waits on a retry list that keeps its place, and is read first on each later pass whose listing gets through, for up to five passes in a row. Then the server stops trying, and delivers one `thread.read_failed` event on that thread's channel, naming the cause, tagged `chat:mention` since the server addresses it to the agent; a thread gone or out of the token's reach gets that at once. It reads the thread again, from where it left off, when the thread next moves on GitHub, while its place is among the last 200 threads read. GitHub's rate limit counts no pass against a thread: it ends the pass's reads, and the rest wait for the next pass. A thread with more new rows in one of its lists (comments, review comments or reviews) than one read takes, 2,000 a list, is read from its latest update on, and its `thread.read_failed` event says its backlog was skipped. A listing that runs past 20 pages (1,000 threads) delivers what it listed and logs the window it may have missed.
+
+**Where delivery begins.** A first start, with no watermark stored, lists what GitHub notified from one poll interval before the start, as App mode's repository poll begins, and logs that instant to stderr. GitHub writes a notification some seconds after the activity it reports (about 20 s on one account in October 2026). So a thread read for the first time is read from five minutes before GitHub's previous answer to a listing, or, at a first start, five minutes before that instant. Comments and reviews from those five minutes arrive, and so does an opening or a close; anything older on that thread doesn't. A thread that opened in those five minutes arrives as opened, with its text as it is now. Otherwise an edit on a thread read for the first time arrives as nothing, since with nothing to compare it with, an edit can't be told from a comment's bump: an edit that mentions the agent on an older issue it hasn't read before doesn't reach it.
+
+**What it can't see.** Threads you aren't part of, pushes, and the checks on pull requests the token's user didn't open. GitHub lists a pull request's thread when someone pushes to it, but none of what this mode reads of a thread shows a push, so it delivers nothing for one. The agent learns of new commits from what comes with them, from a check result, or by reading the pull request. An edit to an open pull request arrives as nothing, as with a webhook delivery. A mention arrives with the comment, review or opening that carries it.
+
+**Security.** A user token can do whatever its user can, wherever the user can. The tools' allow-list (`GITHUB_REPOS`) and the absence of merge still apply, but they're the server's limits, not GitHub's. An `APPROVE` through `github.review` is the user's own approval, and counts toward branch protection wherever the user has write access; the shipped recipe doesn't enable that feature set.
+
+The recipe is App mode's contributor one, [`examples/recipe-contributor.json`](examples/recipe-contributor.json): its wake policies serve both modes, and the launcher reads this mode's variables from the same environment file.
 
 ## Plain-MCP mode
 
@@ -380,6 +414,7 @@ contract and is listed here in full.
 | `github:review-comment` | an inline comment on a diff |
 | `github:ci=` | `success`, `failure` |
 | `github:push` | a push with no thread attached |
+| `github:read-failed` | contributor mode stopped reading a thread until it next moves, or skipped its backlog; the event also carries `chat:mention`, since the server addresses it to the agent |
 | `github:actor=maintainer` | the actor is in `GITHUB_MAINTAINERS` |
 
 **Metadata.** Booleans first — these are what `metadataTrue` matches:

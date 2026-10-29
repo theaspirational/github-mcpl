@@ -4,10 +4,12 @@
  *
  * Three concerns live here and nothing else does:
  *
- *   1. **App auth.** An RS256 JWT is minted from GITHUB_APP_ID and the PEM of
- *      GITHUB_APP_PRIVATE_KEY_FILE, the installation id comes from
+ *   1. **Auth.** In App mode an RS256 JWT is minted from GITHUB_APP_ID and the
+ *      PEM of GITHUB_APP_PRIVATE_KEY_FILE, the installation id comes from
  *      GITHUB_APP_INSTALLATION_ID or is discovered for the GITHUB_REPOS entry,
  *      and the installation token is cached and re-minted before it expires.
+ *      In contributor mode every call carries the user token read from
+ *      GITHUB_TOKEN_FILE, which nothing re-mints, so a 401 there is final.
  *   2. **Calls.** Every {@link GitHubApi} method, REST where GitHub has REST
  *      and GraphQL where it does not (review threads, resolve/unresolve, the
  *      draft flag), mapped onto the contract's types.
@@ -17,8 +19,9 @@
  *      status and GitHub's own message — never a token, never a URL.
  *
  * Secrets never reach a log line or an error. The private key is turned into a
- * KeyObject once and the installation token only ever appears in the
- * `authorization` header built inside {@link GitHubAdapter.authedFetch} — and
+ * KeyObject once and the installation token, or the user token, only ever
+ * appears in the `authorization` header built inside
+ * {@link GitHubAdapter.authedFetch} — and
  * because GitHub, undici and octokit can all quote back something we sent,
  * every message and every log line is scrubbed on the way out by
  * {@link GitHubAdapter.redact}. The guarantee there is structural, not
@@ -49,13 +52,14 @@ import {
   type FailedCheck,
   type GitHubApi,
   type Issue,
-  type IssueSearchHit,
+  type IssueSearch,
   type IssueState,
   type IssueStateReason,
   type Logger,
   type PolledComment,
   type PolledIssue,
   type PollRead,
+  type PolledReview,
   type PullRequest,
   type PullRequestFile,
   type RepoRef,
@@ -63,6 +67,7 @@ import {
   type ReviewThread,
   type ReviewThreadComment,
   type SubmittedReview,
+  type ThreadKind,
   type ThreadRef,
   type UpdateIssueInput,
   type UpdatePullRequestInput,
@@ -124,6 +129,18 @@ export const POLL_MAX_PAGES = 3;
  * for at most this many open pull requests; the rest come back without one.
  */
 export const POLL_PR_HEAD_LIMIT = 20;
+/** `GET /notifications` serves at most 50 threads a page. */
+const NOTIFICATIONS_PAGE_SIZE = 50;
+/**
+ * Pages one of contributor mode's reads takes. A thread's read (its comments,
+ * review comments or reviews since its cursor) fails past them rather than
+ * return part of its rows, since its cursor couldn't safely move over a part,
+ * and the poller then reads that thread from its current update on. The
+ * notifications list delivers what its pages held, and says it was cut short.
+ */
+const THREAD_MAX_PAGES = 20;
+/** A rate limit's message, primary or secondary: a 403 that says this will pass. */
+const RATE_LIMITED = /rate limit|abuse detection/i;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Errors and rate-limit state
@@ -193,10 +210,15 @@ export class GitHubApiError extends Error {
     /** The GitHubApi method that failed, e.g. `getIssue`. Never a URL. */
     readonly operation: string,
     readonly possiblyDone = false,
-    readonly answered = true,
+    /**
+     * Whether GitHub answered at all. A request that failed before any HTTP
+     * answer (DNS, a refused or reset connection) has none, whatever status
+     * octokit gave it, and status 0 is this adapter's own failure.
+     */
+    readonly answered: boolean = status > 0,
   ) {
     const safe = redactSecrets(githubMessage);
-    super(`GitHub ${status} on ${operation}: ${safe}`);
+    super(status > 0 ? `GitHub ${status} on ${operation}: ${safe}` : `${operation}: ${safe}`);
     this.name = 'GitHubApiError';
     this.githubMessage = safe;
   }
@@ -233,6 +255,7 @@ interface Failure {
   message: string;
   headers: Record<string, string>;
   read: boolean;
+  /** False when the request failed before GitHub answered. */
   answered: boolean;
 }
 
@@ -261,7 +284,9 @@ interface ApiIssue {
   created_at?: string | null;
   updated_at?: string | null;
   html_url?: string | null;
-  pull_request?: unknown;
+  /** Present on a pull request's row; `merged_at` is null until it's merged. */
+  pull_request?: { merged_at?: string | null } | null;
+  closed_at?: string | null;
   closed_by?: ApiActor | null;
 }
 
@@ -298,6 +323,65 @@ interface ApiComment {
   in_reply_to_id?: number | null;
   issue_url?: string | null;
   pull_request_url?: string | null;
+}
+
+/** One row of `GET /repos/{o}/{r}/pulls/{n}/reviews`. */
+interface ApiReview {
+  id?: number;
+  user?: ApiActor | null;
+  body?: string | null;
+  state?: string | null;
+  submitted_at?: string | null;
+  html_url?: string | null;
+  commit_id?: string | null;
+}
+
+/** One row of `GET /notifications`. */
+interface ApiNotification {
+  id?: string;
+  updated_at?: string | null;
+  reason?: string | null;
+  unread?: boolean;
+  subject?: { type?: string | null; url?: string | null; title?: string | null } | null;
+  repository?: { full_name?: string | null; owner?: { login?: string | null } | null; name?: string | null } | null;
+}
+
+/** One row of `GET /notifications`, mapped: the ingress-only shape the poller reads. */
+export interface NotificationRow {
+  id: string;
+  updatedAt: string;
+  reason: string;
+  unread: boolean;
+  repo: RepoRef;
+  /** `issue` or `pull`: a row with any other subject (a discussion, a commit, a release) isn't listed. */
+  kind: ThreadKind;
+  number: number;
+  title: string;
+}
+
+/** An open pull request the token's user authored, as `GitHubAdapter.listOwnOpenPulls` found it. */
+export interface OwnPull {
+  /** The GITHUB_REPOS entry it is in, as configured. */
+  repo: RepoRef;
+  number: number;
+  /** Its `updated_at`, which a push moves. The search's may lag a push, so an unchanged one is taken to say its head hasn't moved only for a while. */
+  updatedAt: string;
+  html_url: string;
+}
+
+/** What `GitHubAdapter.listNotifications` read: every page's threads, and the first page's headers. */
+export interface NotificationsPage {
+  notifications: NotificationRow[];
+  /** True on a 304: `notifications` is empty and nothing changed since `ifModifiedSince`. */
+  notModified: boolean;
+  /** `Last-Modified` (an HTTP-date), to pass back as the next call's `ifModifiedSince`. */
+  lastModified: string | null;
+  /** The answer's `Date` (an HTTP-date): GitHub's clock when it answered. */
+  date: string | null;
+  /** `X-Poll-Interval`, in seconds, when GitHub sent one. */
+  pollIntervalSeconds: number | null;
+  /** True when the listing stopped at its page cap with threads left unlisted. */
+  truncated: boolean;
 }
 
 /** One row of `GET /repos/{o}/{r}/commits/{sha}/check-runs`. */
@@ -448,11 +532,20 @@ export class GitHubAdapter implements GitHubApi {
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly baseFetch: typeof globalThis.fetch;
-  private readonly privateKey: KeyObject;
+  /** App mode only: null in contributor mode, which mints nothing. */
+  private readonly privateKey: KeyObject | null;
+  /** Contributor mode only: the static token every call authenticates with. */
+  private readonly userToken: string | null;
 
-  /** JWT-authenticated: `/app`, installation discovery, token minting. */
-  private readonly appOctokit: Octokit;
-  /** Installation-token-authenticated: everything the tools and channels do. */
+  /**
+   * JWT-authenticated: `/app`, installation discovery, token minting. Null in
+   * contributor mode, which has no App identity to JWT-authenticate as.
+   */
+  private readonly appOctokit: Octokit | null;
+  /**
+   * App mode: installation-token-authenticated. Contributor mode: the user
+   * token directly. Either way, everything the tools and channels do.
+   */
   private readonly octokit: Octokit;
 
   private jwtCache: { token: string; expiresAt: number } | null = null;
@@ -498,9 +591,6 @@ export class GitHubAdapter implements GitHubApi {
     this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     const base = options.fetch ?? globalThis.fetch;
     this.baseFetch = (input, init) => base(input, init);
-    // Throws on a malformed PEM before any call is made, and the KeyObject is
-    // the only form of the key that is kept.
-    this.privateKey = createPrivateKey(config.privateKeyPem);
     this.installationIdCache = config.installationId;
 
     const octokitLog = this.octokitLog();
@@ -519,17 +609,39 @@ export class GitHubAdapter implements GitHubApi {
       // warnings use, and that one defaults to `console`.
       log: octokitLog,
     };
-    this.appOctokit = new Octokit({
-      ...common,
-      request: { fetch: this.authedFetch(async () => `Bearer ${await this.appJwt()}`), log: octokitLog },
-    });
-    this.octokit = new Octokit({
-      ...common,
-      request: {
-        fetch: this.authedFetch(async () => `token ${await this.installationToken()}`),
-        log: octokitLog,
-      },
-    });
+
+    if (config.authMode === 'token') {
+      // Contributor mode: one static token, straight from GITHUB_TOKEN_FILE.
+      // No JWT, no installation, nothing to mint or refresh — so there is no
+      // App octokit and no private key to parse.
+      this.privateKey = null;
+      this.userToken = config.userToken as string;
+      this.appOctokit = null;
+      this.octokit = new Octokit({
+        ...common,
+        request: { fetch: this.authedFetch(async () => `token ${this.userToken as string}`), log: octokitLog },
+      });
+      // The token does not expire on a schedule the way a minted one does, so
+      // it is remembered for the life of the process rather than pruned by
+      // validity — `redact` still has to find it in every log line and error.
+      this.remember(this.userToken, Number.POSITIVE_INFINITY);
+    } else {
+      this.userToken = null;
+      // Throws on a malformed PEM before any call is made, and the KeyObject
+      // is the only form of the key that is kept.
+      this.privateKey = createPrivateKey(config.privateKeyPem as string);
+      this.appOctokit = new Octokit({
+        ...common,
+        request: { fetch: this.authedFetch(async () => `Bearer ${await this.appJwt()}`), log: octokitLog },
+      });
+      this.octokit = new Octokit({
+        ...common,
+        request: {
+          fetch: this.authedFetch(async () => `token ${await this.installationToken()}`),
+          log: octokitLog,
+        },
+      });
+    }
   }
 
   /**
@@ -710,7 +822,7 @@ export class GitHubAdapter implements GitHubApi {
     const header = b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
     const payload = b64url(JSON.stringify({ iat: issuedAt, exp: expiresAtSec, iss: this.config.appId }));
     const signingInput = `${header}.${payload}`;
-    const signature = createSign('RSA-SHA256').update(signingInput).sign(this.privateKey);
+    const signature = createSign('RSA-SHA256').update(signingInput).sign(this.privateKey as KeyObject);
     const token = `${signingInput}.${b64url(signature)}`;
     this.jwtCache = { token, expiresAt: expiresAtSec * 1000 };
     this.remember(token, expiresAtSec * 1000);
@@ -738,7 +850,7 @@ export class GitHubAdapter implements GitHubApi {
     const id = await this.call(
       'resolveInstallationId',
       async () => {
-        const res = await this.appOctokit.request('GET /repos/{owner}/{repo}/installation', {
+        const res = await (this.appOctokit as Octokit).request('GET /repos/{owner}/{repo}/installation', {
           owner: repo.owner,
           repo: repo.name,
         });
@@ -770,7 +882,7 @@ export class GitHubAdapter implements GitHubApi {
     const minted = await this.call(
       'mintInstallationToken',
       async () => {
-        const res = await this.appOctokit.request('POST /app/installations/{installation_id}/access_tokens', {
+        const res = await (this.appOctokit as Octokit).request('POST /app/installations/{installation_id}/access_tokens', {
           installation_id: installationId,
         });
         const data = res.data as { token?: string; expires_at?: string };
@@ -851,8 +963,10 @@ export class GitHubAdapter implements GitHubApi {
 
         const failure = normalizeFailure(raw);
 
-        // A token that GitHub no longer accepts: mint once more, try once more.
-        if (failure.status === 401 && refreshAuth && !authRetried) {
+        // A token that GitHub no longer accepts: mint once more, try once
+        // more. Contributor mode's token cannot be re-minted — it is the one
+        // static secret in GITHUB_TOKEN_FILE — so a 401 there is terminal.
+        if (failure.status === 401 && refreshAuth && !authRetried && this.config.authMode === 'app') {
           authRetried = true;
           this.invalidateToken();
           this.log('warn', 'github rejected the installation token; re-minting', { operation });
@@ -1120,15 +1234,22 @@ export class GitHubAdapter implements GitHubApi {
   }
 
   /**
-   * Search inside the one repository. Any `repo:` qualifier in `query` is
-   * dropped before the adapter's own is prefixed: GitHub ORs repo qualifiers
-   * together, so leaving a caller's in would widen the search past the
-   * allow-list.
+   * Search inside the one repository. Any `repo:`, `user:`, `org:` or
+   * `owner:` qualifier in `query` is dropped before the adapter's own `repo:`
+   * is prefixed: GitHub ORs those together, so leaving a caller's in would
+   * widen the search past the allow-list, which a user token reaches far
+   * beyond. Whatever GitHub still returns from another repository on the
+   * page is left out, and counted, so no title or link from outside the one
+   * repository reaches the answer.
    */
-  async searchIssues(repo: RepoRef, query: string, limit: number = LIMITS.listEntries): Promise<IssueSearchHit[]> {
-    const scrubbed = query.replace(/(^|\s)-?repo:\S+/gi, ' ').trim();
+  async searchIssues(repo: RepoRef, query: string, limit: number = LIMITS.listEntries): Promise<IssueSearch> {
+    // A qualifier counts wherever no letter, digit, underscore or hyphen comes
+    // right before it, which takes in GitHub's own reading of
+    // `"x"user:octocat` (a live search, October 2026); dropping it leaves the
+    // rest as written.
+    const scrubbed = query.replace(/(?<![\w-])-?(?:repo|user|org|owner):[^\s()]+/gi, ' ').replace(/\s+/g, ' ').trim();
     if (scrubbed !== query.trim()) {
-      this.log('debug', 'dropped a repo: qualifier from a search; searches stay inside the allow-list', {
+      this.log('debug', 'dropped a repo:, user:, org: or owner: qualifier from a search; searches stay inside the allow-list', {
         repo: repoSlug(repo),
       });
     }
@@ -1138,8 +1259,9 @@ export class GitHubAdapter implements GitHubApi {
         q: `repo:${repoSlug(repo)} ${scrubbed}`.trim(),
         per_page: perPage,
       });
-      const items = ((res.data as { items?: ApiIssue[] }).items ?? []).slice(0, perPage);
-      return items.map((item) => ({
+      const items = ((res.data as { items?: (ApiIssue & { repository_url?: string })[] }).items ?? []).slice(0, perPage);
+      const inside = items.filter((item) => sameRepoAsGitHub(repoOfUrl(item.repository_url), repo));
+      const hits = inside.map((item) => ({
         number: item.number ?? 0,
         kind: item.pull_request ? ('pull' as const) : ('issue' as const),
         title: item.title ?? '',
@@ -1147,6 +1269,7 @@ export class GitHubAdapter implements GitHubApi {
         updatedAt: item.updated_at ?? '',
         html_url: item.html_url ?? '',
       }));
+      return { hits, outside: items.length - inside.length };
     });
   }
 
@@ -1415,19 +1538,7 @@ export class GitHubAdapter implements GitHubApi {
       }),
     );
 
-    const polled: PolledIssue[] = rows.map((row) => ({
-      id: row.id ?? 0,
-      number: row.number ?? 0,
-      isPullRequest: row.pull_request != null,
-      title: row.title ?? '',
-      body: row.body ?? '',
-      state: issueStateOf(row.state),
-      author: actorOf(row.user),
-      createdAt: row.created_at ?? '',
-      updatedAt: row.updated_at ?? '',
-      html_url: row.html_url ?? '',
-      ...(row.closed_by ? { closedBy: actorOf(row.closed_by) } : {}),
-    }));
+    const polled: PolledIssue[] = rows.map(polledIssueOf);
 
     const openPulls = polled.filter((p) => p.isPullRequest && p.state === 'open').slice(0, POLL_PR_HEAD_LIMIT);
     for (const pull of openPulls) {
@@ -1478,18 +1589,373 @@ export class GitHubAdapter implements GitHubApi {
     return resumeAt === undefined ? { rows: polled } : { rows: polled, resumeAt };
   }
 
+  // ───────────────────────────────────────────────────────────────────────────
+  // Contributor-mode ingress: notifications
+  // ───────────────────────────────────────────────────────────────────────────
+
   /**
-   * The App's own identity. `GET /app` is JWT-authenticated and answers with
-   * the App's slug; the login that appears as a comment author is that slug
-   * with `[bot]` appended, which is what GITHUB_BOT_LOGIN holds. Cached: an
-   * App does not rename itself mid-session.
+   * Every page of `GET /notifications?all=true&participating=true&since=…`:
+   * the threads the token's user takes part in that GitHub updated after
+   * `since`, read or unread, so nothing depends on what anyone has marked
+   * read. The first page is conditional on `ifModifiedSince` (a
+   * `Last-Modified` this method answered before), and a 304 there answers
+   * `notModified` with nothing more read. Each page goes through
+   * {@link GitHubAdapter.call}, with its rate-limit retry and redaction.
+   *
+   * GitHub serves these endpoints to a personal access token (classic) only,
+   * so a 403 that isn't a rate limit says so, naming the token type.
+   */
+  async listNotifications(opts: { since: string; ifModifiedSince: string | null }): Promise<NotificationsPage> {
+    const notifications: NotificationRow[] = [];
+    let head: Omit<NotificationsPage, 'notifications'> | null = null;
+    try {
+      for (let page = 1; ; page++) {
+        const read = this.call('listNotifications', async () => {
+          try {
+            const res = await this.octokit.request('GET /notifications', {
+              all: true,
+              participating: true,
+              since: opts.since,
+              per_page: NOTIFICATIONS_PAGE_SIZE,
+              page,
+              headers: page === 1 && opts.ifModifiedSince ? { 'if-modified-since': opts.ifModifiedSince } : {},
+            });
+            return { notModified: false as const, rows: res.data as ApiNotification[], headers: res.headers as Record<string, string | undefined> };
+          } catch (raw) {
+            const failure = page === 1 ? normalizeFailure(raw) : null;
+            if (failure?.status === 304) return { notModified: true as const, rows: [], headers: failure.headers };
+            throw raw;
+          }
+        });
+        if (page > THREAD_MAX_PAGES) {
+          // A page past the cap is read only to learn whether there was more
+          // to list. Any row there, or a page that can't be read, may mean
+          // threads past it: the listing is still what pages 1 to the cap gave.
+          const more = await read.then(
+            (answer) => answer.rows.length > 0,
+            () => true,
+          );
+          if (more) head!.truncated = true;
+          break;
+        }
+        const answer = await read;
+        if (page === 1) {
+          head = {
+            notModified: answer.notModified,
+            lastModified: answer.headers['last-modified'] ?? null,
+            date: answer.headers['date'] ?? null,
+            pollIntervalSeconds: numberOrNull(answer.headers['x-poll-interval']),
+            truncated: false,
+          };
+          if (answer.notModified) return { ...head, notifications: [] };
+        }
+        notifications.push(...answer.rows.map(mapNotification).filter((n): n is NotificationRow => n !== null));
+        if (answer.rows.length < NOTIFICATIONS_PAGE_SIZE) break;
+      }
+    } catch (err) {
+      if (err instanceof GitHubApiError && err.status === 403 && !RATE_LIMITED.test(err.githubMessage)) {
+        throw new GitHubApiError(
+          403,
+          `${err.githubMessage} (GitHub serves the notifications endpoints to a personal access token (classic) only, with the notifications scope; a fine-grained token can't read them)`,
+          'listNotifications',
+        );
+      }
+      throw err;
+    }
+    return { ...head!, notifications };
+  }
+
+  /**
+   * A thread's row as the issues endpoint gives it, which a pull request has
+   * too: its state, when it was opened and closed, and who closed it, which
+   * for a merged pull request is whoever merged it. No head sha, so the
+   * poller reports no new commits: GitHub lists a pull request's thread when
+   * someone pushes to it, and a pass that reads it then finds nothing new.
+   * The agent learns of new commits from what comes with them, or by reading
+   * the pull request.
+   */
+  async getPolledThread(thread: ThreadRef): Promise<PolledIssue> {
+    return this.call('getPolledThread', async () => {
+      const res = await this.octokit.request('GET /repos/{owner}/{repo}/issues/{issue_number}', {
+        owner: thread.repo.owner,
+        repo: thread.repo.name,
+        issue_number: thread.number,
+      });
+      return polledIssueOf(res.data as ApiIssue);
+    });
+  }
+
+  /** A thread's conversation comments updated at or after `since`, every page, oldest first. */
+  async listCommentsSince(thread: ThreadRef, since: string): Promise<PolledComment[]> {
+    const rows = await this.everyPage<ApiComment>('listCommentsSince', (page) =>
+      this.octokit.request('GET /repos/{owner}/{repo}/issues/{issue_number}/comments', {
+        owner: thread.repo.owner,
+        repo: thread.repo.name,
+        issue_number: thread.number,
+        since,
+        per_page: 100,
+        page,
+      }),
+    );
+    return rows.map((row) => mapPolledComment(row, thread.number));
+  }
+
+  /** A pull request's review comments updated at or after `since`, every page, oldest update first. */
+  async listPullReviewCommentsSince(pull: ThreadRef, since: string): Promise<PolledComment[]> {
+    const rows = await this.everyPage<ApiComment>('listPullReviewCommentsSince', (page) =>
+      this.octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}/comments', {
+        owner: pull.repo.owner,
+        repo: pull.repo.name,
+        pull_number: pull.number,
+        sort: 'updated',
+        direction: 'asc',
+        since,
+        per_page: 100,
+        page,
+      }),
+    );
+    return rows.map((row) => mapPolledComment(row, pull.number));
+  }
+
+  /**
+   * A pull request's reviews submitted at or after `since`, in the order they
+   * were submitted, which is the order `GET pulls/{n}/reviews` lists them in.
+   * That list takes no `since`, so this reads its first page, whose `Link`
+   * header names the last, then reads back from the last page to the first page
+   * that starts before `since`. A read costs page 1 and those pages, whatever
+   * the pull request's history. At or after, not after: a review submitted in
+   * the second the cursor names comes again, and the poller drops it. More than
+   * {@link THREAD_MAX_PAGES} pages holding new reviews fail the read, as the
+   * other per-thread reads do ({@link ReadCapError}), and so does a `Link` that
+   * names a next page but no last, which this read couldn't walk back from.
+   */
+  async listReviewsSince(pull: ThreadRef, since: string): Promise<PolledReview[]> {
+    const sinceMs = Date.parse(since);
+    const submitted = (row: ApiReview): number => Date.parse(row.submitted_at ?? '');
+    const read = (page: number) =>
+      this.call('listReviewsSince', async () => {
+        const res = await this.octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews', {
+          owner: pull.repo.owner,
+          repo: pull.repo.name,
+          pull_number: pull.number,
+          per_page: 100,
+          page,
+        });
+        // A plain Error: call() names the operation once.
+        if (!Array.isArray(res.data)) throw new Error(`GitHub answered page ${page} with something other than a list`);
+        return { rows: res.data as ApiReview[], last: lastPageOf((res.headers as Record<string, string | undefined>).link) };
+      });
+    const first = await read(1);
+    const last = first.last;
+    if (last === null) {
+      throw new GitHubApiError(0, 'its reviews list named a next page but no last page, so it could not be read from the newest back', 'listReviewsSince');
+    }
+    let rows: ApiReview[] = [];
+    let page = last;
+    while (page > 1) {
+      const batch = (await read(page)).rows;
+      // Past the cap, a page counts only if it holds a new review too, as page 1 does below.
+      if (last - page >= THREAD_MAX_PAGES && batch.some((row) => submitted(row) >= sinceMs)) throw new ReadCapError('listReviewsSince');
+      rows = [...batch, ...rows];
+      if (batch.some((row) => submitted(row) < sinceMs)) break;
+      page -= 1;
+    }
+    if (page === 1) {
+      // Every page after it was new: page 1 counts against the cap only if it holds a new review too.
+      if (last > THREAD_MAX_PAGES && first.rows.some((row) => submitted(row) >= sinceMs)) throw new ReadCapError('listReviewsSince');
+      rows = [...first.rows, ...rows];
+    }
+    const newer = rows.filter((row) => {
+      const at = submitted(row);
+      return Number.isFinite(at) && (!Number.isFinite(sinceMs) || at >= sinceMs);
+    });
+    newer.sort((a, b) => submitted(a) - submitted(b));
+    return newer.map(mapPolledReview);
+  }
+
+  /**
+   * Every page of one of the notifications poller's per-thread reads, 100
+   * rows a page, until a short page. Past {@link THREAD_MAX_PAGES} the read
+   * fails rather than return part of the rows, since a cursor can't safely
+   * move over a part ({@link ReadCapError}). The poller then reads the thread
+   * from its current update on, and its notice says the backlog was skipped.
+   */
+  private async everyPage<T>(operation: string, fetchPage: (page: number) => Promise<{ data: unknown }>): Promise<T[]> {
+    const rows: T[] = [];
+    for (let page = 1; ; page++) {
+      const batch = await this.call(operation, async () => {
+        const res = await fetchPage(page);
+        // A plain Error: call() names the operation once.
+        if (!Array.isArray(res.data)) throw new Error(`GitHub answered page ${page} with something other than a list`);
+        return res.data as T[];
+      });
+      if (page > THREAD_MAX_PAGES) {
+        // A page past the cap is read only to learn whether there was more.
+        if (batch.length === 0) return rows;
+        throw new ReadCapError(operation);
+      }
+      rows.push(...batch);
+      if (batch.length < 100) return rows;
+    }
+  }
+
+  /**
+   * Contributor mode: the open pull requests `login` authored in `repos`, most
+   * recently updated first, from one search (the search API's own rate limit,
+   * not the 5,000 an hour), one page of 100, past which it logs what it left
+   * out. A result from any other
+   * repository is left out. The search names no head, so
+   * {@link GitHubAdapter.getPullHeadSha} reads it.
+   */
+  async listOwnOpenPulls(login: string, repos: readonly RepoRef[]): Promise<OwnPull[]> {
+    if (repos.length === 0) return [];
+    return this.call('listOwnOpenPulls', async () => {
+      const res = await this.octokit.request('GET /search/issues', {
+        q: `is:pr is:open author:${login} ${repos.map((repo) => `repo:${repoSlug(repo)}`).join(' ')}`,
+        sort: 'updated',
+        order: 'desc',
+        per_page: 100,
+      });
+      const data = res.data as { total_count?: number; items?: (ApiIssue & { repository_url?: string })[] };
+      const items = data.items ?? [];
+      if ((data.total_count ?? 0) > items.length) {
+        this.log('warn', 'more open pull requests by the token\'s user than one search page holds; only the most recently updated have their checks looked up', {
+          total: data.total_count,
+          read: items.length,
+        });
+      }
+      const pulls: OwnPull[] = [];
+      for (const item of items) {
+        const repo = repos.find((allowed) => sameRepoAsGitHub(repoOfUrl(item.repository_url), allowed));
+        if (!repo || !item.pull_request || !item.number) continue;
+        pulls.push({ repo, number: item.number, updatedAt: item.updated_at ?? '', html_url: item.html_url ?? '' });
+      }
+      return pulls;
+    });
+  }
+
+  /** A pull request's head sha, and nothing else: one read, with none of {@link GitHubAdapter.getPullRequest}'s check runs. */
+  async getPullHeadSha(pull: ThreadRef): Promise<string> {
+    return this.call('getPullHeadSha', async () => {
+      const res = await this.octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
+        owner: pull.repo.owner,
+        repo: pull.repo.name,
+        pull_number: pull.number,
+      });
+      const sha = (res.data as ApiPull).head?.sha ?? '';
+      // A plain Error: call() names the operation once.
+      if (!sha) throw new Error('GitHub answered with no head sha');
+      return sha;
+    });
+  }
+
+  /**
+   * Contributor mode: the token's login, which from-self and the own-comment
+   * checks compare against exactly, or why the start can't go on. A set
+   * GITHUB_BOT_LOGIN must be the token's own login as GitHub spells it, since
+   * any other value would wake the agent on its own posts; an unset one is
+   * the login `GET /user` answers. A token GitHub refuses (401, or a 403 that
+   * isn't a rate limit) is a problem either way. When GitHub doesn't answer
+   * (unreachable, a server error, a rate limit), a set value is used
+   * unchecked, with a warning, and an unset one is a problem: there is no
+   * login to use.
+   */
+  async checkTokenLogin(botLogin: string): Promise<{ login: string; problem: null } | { login: null; problem: string }> {
+    let login: string;
+    try {
+      login = (await this.getAuthenticatedBot()).login;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (err instanceof GitHubApiError && (err.status === 401 || (err.status === 403 && !isRateLimit(err)))) {
+        return {
+          login: null,
+          problem: botLogin
+            ? `GET /user refused the token in GITHUB_TOKEN_FILE, so GITHUB_BOT_LOGIN can't be checked against it: ${message}`
+            : `GET /user refused the token in GITHUB_TOKEN_FILE, so its login is unknown: ${message}`,
+        };
+      }
+      if (!botLogin) {
+        return {
+          login: null,
+          problem: `GITHUB_BOT_LOGIN is unset and GET /user failed, so the token's login is unknown: set GITHUB_BOT_LOGIN, or start again once GitHub answers (${message})`,
+        };
+      }
+      this.log('warn', 'GET /user failed, so GITHUB_BOT_LOGIN is unchecked against the token', { error: message });
+      return { login: botLogin, problem: null };
+    }
+    if (!botLogin || login === botLogin) return { login, problem: null };
+    return {
+      login: null,
+      problem: `GITHUB_BOT_LOGIN is "${botLogin}", but the token in GITHUB_TOKEN_FILE belongs to "${login}": set GITHUB_BOT_LOGIN to "${login}", spelled exactly so, or leave it unset`,
+    };
+  }
+
+  /**
+   * Contributor mode: what's wrong with GITHUB_REPOS's spelling, one line per
+   * entry. Notifications name a repository as GitHub spells it, and the
+   * allow-list compares exactly, so an entry spelled otherwise ("the-glassy/x"
+   * for "The-Glassy/x") would drop that repository's notifications silently
+   * and refuse its events' tool calls. An entry the token can't see is a
+   * problem too. An entry GitHub didn't answer for (unreachable, a server
+   * error, a rate limit) is left unchecked, with a warning.
+   */
+  async repoSpellingProblems(repos: readonly RepoRef[]): Promise<string[]> {
+    const problems: string[] = [];
+    for (const repo of repos) {
+      const slug = repoSlug(repo);
+      let fullName: string;
+      try {
+        fullName = await this.call('getRepository', async () => {
+          const res = await this.octokit.request('GET /repos/{owner}/{repo}', { owner: repo.owner, repo: repo.name });
+          return String((res.data as { full_name?: unknown }).full_name ?? '');
+        });
+      } catch (err) {
+        if (isLastingFailure(err)) {
+          problems.push(`GITHUB_REPOS names "${slug}", which the token in GITHUB_TOKEN_FILE can't see (${describeFailure(err)})`);
+        } else {
+          this.log('warn', 'GET /repos failed, so a GITHUB_REPOS entry is unchecked against GitHub\'s spelling', {
+            repo: slug,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+        continue;
+      }
+      if (fullName !== '' && fullName !== slug) {
+        problems.push(`GITHUB_REPOS names "${slug}", but GitHub spells it "${fullName}": set it to "${fullName}", spelled exactly so`);
+      }
+    }
+    return problems;
+  }
+
+  /**
+   * App mode: the App's own identity. `GET /app` is JWT-authenticated and
+   * answers with the App's slug; the login that appears as a comment author
+   * is that slug with `[bot]` appended, which is what GITHUB_BOT_LOGIN holds.
+   *
+   * Contributor mode: the token's own identity, `GET /user` — a human
+   * account, so `isBot` is false even though GITHUB_BOT_LOGIN is set to it for
+   * from-self and mention detection.
+   *
+   * Cached either way: neither identity renames itself mid-session.
    */
   async getAuthenticatedBot(): Promise<BotIdentity> {
     if (this.botCache) return this.botCache;
+    if (this.config.authMode === 'token') {
+      const identity = await this.call('getAuthenticatedBot', async () => {
+        const res = await this.octokit.request('GET /user');
+        const data = res.data as { login?: string | null; id?: number } | null;
+        return { login: data?.login ?? '', id: data?.id ?? 0, isBot: false };
+      });
+      if (!identity.login) {
+        throw new GitHubApiError(0, 'GET /user answered without a login, so the token identity is unknown', 'getAuthenticatedBot');
+      }
+      this.botCache = identity;
+      return identity;
+    }
     const identity = await this.call(
       'getAuthenticatedBot',
       async () => {
-        const res = await this.appOctokit.request('GET /app');
+        const res = await (this.appOctokit as Octokit).request('GET /app');
         const data = res.data as { slug?: string | null; id?: number; name?: string | null } | null;
         const slug = data?.slug ?? data?.name ?? '';
         return { login: slug ? `${slug}[bot]` : '', id: data?.id ?? 0, isBot: true as const };
@@ -1664,6 +2130,94 @@ function authFailureIn(raw: unknown): GitHubApiError | null {
   return null;
 }
 
+/** An issues-endpoint row, a list's or a single issue's, as a {@link PolledIssue}. */
+function polledIssueOf(row: ApiIssue): PolledIssue {
+  return {
+    id: row.id ?? 0,
+    number: row.number ?? 0,
+    isPullRequest: row.pull_request != null,
+    title: row.title ?? '',
+    body: row.body ?? '',
+    state: issueStateOf(row.state),
+    author: actorOf(row.user),
+    createdAt: row.created_at ?? '',
+    updatedAt: row.updated_at ?? '',
+    html_url: row.html_url ?? '',
+    ...(row.closed_by ? { closedBy: actorOf(row.closed_by) } : {}),
+    ...(row.closed_at ? { closedAt: row.closed_at } : {}),
+    ...(row.pull_request?.merged_at === undefined ? {} : { merged: typeof row.pull_request.merged_at === 'string' }),
+  };
+}
+
+/**
+ * The page a `Link` header names `rel="last"`: 1 when it names no next page
+ * either, as on a list's only page, and null when it names a next page but no
+ * last, as a list paged by cursor would.
+ */
+function lastPageOf(link: string | undefined): number | null {
+  const m = /[?&]page=(\d+)[^>]*>;\s*rel="last"/.exec(link ?? '');
+  if (m) return Number(m[1]);
+  return /rel="next"/.test(link ?? '') ? null : 1;
+}
+
+/**
+ * A failure the same read will meet again next pass: the thing is gone (404,
+ * 410), or out of the token's reach (a 403 that isn't a rate limit). The
+ * notifications poller lets such a thread go until it next moves, rather than
+ * read it again each pass.
+ */
+export function isLastingFailure(err: unknown): boolean {
+  if (!(err instanceof GitHubApiError)) return false;
+  if (err.status === 404 || err.status === 410) return true;
+  return err.status === 403 && !RATE_LIMITED.test(err.githubMessage);
+}
+
+/**
+ * A per-thread read with more rows than {@link THREAD_MAX_PAGES} pages hold.
+ * The notifications poller can't move a cursor over part of them, and the
+ * same read will meet the same cap again, so it reads the thread from its
+ * current update on and tells the agent.
+ */
+export class ReadCapError extends GitHubApiError {
+  constructor(operation: string) {
+    super(0, `more than ${THREAD_MAX_PAGES * 100} comments or reviews to read at once`, operation);
+    this.name = 'ReadCapError';
+  }
+}
+
+/**
+ * A failure in its reader's terms, an agent's or an operator's: GitHub's
+ * status and words, or what went wrong, without the adapter's method names.
+ */
+export function describeFailure(err: unknown): string {
+  if (err instanceof GitHubApiError) {
+    if (err.answered) return `GitHub answered ${err.status}: ${err.githubMessage}`;
+    return err.status > 0 ? `the request to GitHub failed: ${err.githubMessage}` : err.githubMessage;
+  }
+  return `the request to GitHub failed: ${err instanceof Error ? err.message : String(err)}`;
+}
+
+/** The repository an API URL such as a search result's `repository_url` names, or null. */
+function repoOfUrl(url: string | undefined): RepoRef | null {
+  const m = /\/repos\/([^/]+)\/([^/]+)$/.exec(url ?? '');
+  return m ? { owner: m[1]!, name: m[2]! } : null;
+}
+
+/** The same repository as GitHub counts it, whose owner and repository names ignore case; null is no repository. */
+function sameRepoAsGitHub(a: RepoRef | null, b: RepoRef): boolean {
+  return a !== null && a.owner.toLowerCase() === b.owner.toLowerCase() && a.name.toLowerCase() === b.name.toLowerCase();
+}
+
+/**
+ * GitHub's rate limit, primary or secondary: a 429, or a 403 whose message
+ * says so. It passes with time and says nothing about the thread read, so the
+ * notifications poller counts no pass against a thread for it.
+ */
+export function isRateLimit(err: unknown): boolean {
+  if (!(err instanceof GitHubApiError)) return false;
+  return err.status === 429 || (err.status === 403 && RATE_LIMITED.test(err.githubMessage));
+}
+
 function mapPolledComment(row: ApiComment, number: number): PolledComment {
   const polled: PolledComment = {
     id: row.id ?? 0,
@@ -1677,6 +2231,65 @@ function mapPolledComment(row: ApiComment, number: number): PolledComment {
   if (row.path != null) polled.path = row.path;
   if (row.in_reply_to_id != null) polled.inReplyTo = row.in_reply_to_id;
   return polled;
+}
+
+function mapPolledReview(row: ApiReview): PolledReview {
+  const review: PolledReview = {
+    id: row.id ?? 0,
+    author: actorOf(row.user),
+    body: row.body ?? '',
+    state: reviewStateOf(row.state),
+    submittedAt: row.submitted_at ?? '',
+    html_url: row.html_url ?? '',
+  };
+  if (row.commit_id != null) review.commitId = row.commit_id;
+  return review;
+}
+
+/**
+ * `GET /notifications`'s `subject.type` → the contract's `ThreadKind`, or
+ * `null` for a subject this ingress has no event kinds for (`Discussion`,
+ * `Commit`, `Release`, `CheckSuite`, …) — dropped rather than guessed.
+ */
+function notificationKindOf(type: string | null | undefined): ThreadKind | null {
+  if (type === 'Issue') return 'issue';
+  if (type === 'PullRequest') return 'pull';
+  return null;
+}
+
+/**
+ * A notification row, mapped. `repository.full_name` is split the same way
+ * `repoFrom` (normalize.ts) splits a webhook's, and `subject.url` — the API
+ * url of the issue or pull request, `…/issues/7` or `…/pulls/7` — is read with
+ * the same regex `numberFromUrl` uses on a comment's. A row whose repository
+ * is unparseable or whose subject names no kind this ingress maps is dropped
+ * (null): there is nothing a poll pass could ask GitHub about.
+ */
+function mapNotification(row: ApiNotification): NotificationRow | null {
+  const full = row.repository?.full_name ?? '';
+  const [owner, name] =
+    full.includes('/') ? full.split('/', 2) : [row.repository?.owner?.login ?? '', row.repository?.name ?? ''];
+  if (!owner || !name) return null;
+  const kind = notificationKindOf(row.subject?.type);
+  const number = numberFromUrl(row.subject?.url);
+  if (!row.id || kind === null || number === 0) return null;
+  return {
+    id: row.id,
+    updatedAt: row.updated_at ?? '',
+    reason: row.reason ?? '',
+    unread: row.unread === true,
+    repo: { owner, name },
+    kind,
+    number,
+    title: row.subject?.title ?? '',
+  };
+}
+
+/** `X-Poll-Interval` (seconds) → a finite number, or null for anything else. */
+function numberOrNull(value: string | undefined): number | null {
+  if (value === undefined) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
 }
 
 /**
@@ -1722,6 +2335,7 @@ export function summarizeChecks(
     conclusion,
     total: options.total ?? runs.length,
     failed: failed.slice(0, LIMITS.listEntries),
+    ...(incomplete ? { unfinished: true } : {}),
   };
 }
 
@@ -1752,7 +2366,7 @@ function normalizeFailure(raw: unknown): Failure {
   // a GraphqlResponseError, which has no status of its own.
   if (Array.isArray(err?.errors) && err.errors.length > 0 && err?.status === undefined) {
     const message = err.errors.map((e) => e?.message ?? '').filter(Boolean).join('; ');
-    return { status: err.response?.status ?? 200, message: message || 'GraphQL error', headers, read, answered };
+    return { status: err.response?.status ?? 200, message: message || 'GraphQL error', headers, read, answered: true };
   }
 
   const data = err?.response?.data as { message?: string } | undefined;

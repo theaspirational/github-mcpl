@@ -214,18 +214,22 @@ The contract names the variables but not every default or requiredness.
   names the branch. An entry is `branch` (every repository) or
   `owner/name:branch` (that one); a scoped entry outside `GITHUB_REPOS` is a
   startup error.
-- `GITHUB_REPOS` took exactly one entry in v1. It now takes several of one
-  owner: one owner is one App installation and one token, which is what the
-  adapter holds. With several entries the tools' `repo` argument and the
-  repository half of `thread` stop defaulting and become required.
+- `GITHUB_REPOS` took exactly one entry in v1. With the App it now takes
+  several of one owner: one owner is one App installation and one token,
+  which is what the adapter holds. Contributor mode's user token reaches
+  every owner its user can, so there the list may span owners. With several
+  entries the tools' `repo` argument and the repository half of `thread`
+  stop defaulting and become required.
 - `GITHUB_STATE_FILE` is optional; absent means the state lives in memory for
   the life of the process and `flush()` is a no-op. Checkpoints still work,
   they just do not survive a restart.
 - `GITHUB_REPOS` set but empty is a startup error, as is more than one entry
   (v1). Both are reported as `GITHUB_REPOS: …`.
-- `GITHUB_BOT_LOGIN` is required: from-self detection is a correctness
-  property (without it the server can answer itself), so it is not something
-  to default.
+- `GITHUB_BOT_LOGIN` is required with the App: from-self detection is a
+  correctness property (without it the server can answer itself), so it is
+  not something to guess. Contributor mode can leave it unset, since there
+  `GET /user` says whose the token is: startup takes that login, and stops
+  when GitHub doesn't answer.
 
 ## Not materialized by .1
 

@@ -19,6 +19,7 @@ import * as net from 'node:net';
 import { McplConnection } from '@animalabs/mcpl-core';
 import { GitHubAdapter } from './github-adapter.js';
 import { CheckGate } from './normalize.js';
+import { NotificationsPoller } from './notifications-poller.js';
 import { Poller } from './poller.js';
 import { GitHubMcplServer } from './server.js';
 import { GithubState } from './state.js';
@@ -46,6 +47,7 @@ function registerTools(server: GitHubMcplServer): void {
 interface Running {
   webhook: WebhookListener | null;
   poller: Poller | null;
+  notifications: NotificationsPoller | null;
   state: GithubState;
 }
 
@@ -65,11 +67,15 @@ function buildAdapter(config: Config, log: Logger): GitHubAdapter {
   try {
     return new GitHubAdapter(config, { logger: log });
   } catch (err) {
-    log.error(
-      'GITHUB_APP_PRIVATE_KEY_FILE: the file does not hold a usable RSA private key (expected a ' +
-        'PEM beginning "-----BEGIN RSA PRIVATE KEY-----", the one GitHub offered when the App was ' +
-        `registered): ${(err as Error).message}`,
-    );
+    if (config.authMode === 'token') {
+      log.error(`contributor-mode adapter failed to start: ${(err as Error).message}`);
+    } else {
+      log.error(
+        'GITHUB_APP_PRIVATE_KEY_FILE: the file does not hold a usable RSA private key (expected a ' +
+          'PEM beginning "-----BEGIN RSA PRIVATE KEY-----", the one GitHub offered when the App was ' +
+          `registered): ${(err as Error).message}`,
+      );
+    }
     process.exit(1);
   }
 }
@@ -83,6 +89,19 @@ function buildAdapter(config: Config, log: Logger): GitHubAdapter {
  */
 async function build(config: Config, log: Logger): Promise<{ server: GitHubMcplServer; running: Running }> {
   const api = buildAdapter(config, log);
+  // Contributor mode checks the token and the repositories before anything
+  // else, and takes GITHUB_BOT_LOGIN from the token when it is unset.
+  if (config.authMode === 'token') {
+    const login = await api.checkTokenLogin(config.botLogin);
+    const problems = [login.problem, ...(await api.repoSpellingProblems(config.repos))];
+    const found = problems.filter((p): p is string => p !== null);
+    if (found.length > 0) {
+      for (const problem of found) log.error(problem);
+      process.exit(1);
+    }
+    if (!config.botLogin) log.info('GITHUB_BOT_LOGIN is unset, so it is the token\'s login', { login: login.login });
+    config.botLogin = login.login as string;
+  }
   const state = GithubState.load(config.stateFile, log);
   const server = new GitHubMcplServer(api, {
     botLogin: config.botLogin,
@@ -93,6 +112,23 @@ async function build(config: Config, log: Logger): Promise<{ server: GitHubMcplS
     logger: log,
   });
   registerTools(server);
+
+  // Contributor mode has one ingress, the notifications poller, and no
+  // webhook (readConfig already refused GITHUB_WEBHOOK_PORT in this mode).
+  if (config.authMode === 'token') {
+    const notifications = new NotificationsPoller({
+      api,
+      state,
+      intervalMs: config.pollIntervalMs,
+      repos: config.repos,
+      login: config.botLogin,
+      onEvent: server.onEvent,
+      logger: log,
+    });
+    notifications.start();
+    log.info('polling notifications', { intervalMs: config.pollIntervalMs });
+    return { server, running: { webhook: null, poller: null, notifications, state } };
+  }
 
   const checkGate = new CheckGate();
   const webhook = webhookListenerFromConfig(config, {
@@ -123,7 +159,7 @@ async function build(config: Config, log: Logger): Promise<{ server: GitHubMcplS
     log.info('polling', { intervalMs: config.pollIntervalMs });
   }
 
-  return { server, running: { webhook, poller, state } };
+  return { server, running: { webhook, poller, notifications: null, state } };
 }
 
 /**
@@ -132,8 +168,10 @@ async function build(config: Config, log: Logger): Promise<{ server: GitHubMcplS
  */
 async function shutdown(running: Running, log: Logger): Promise<void> {
   running.poller?.stop();
+  running.notifications?.stop();
   try {
     await running.poller?.whenIdle();
+    await running.notifications?.whenIdle();
   } catch (err) {
     log.warn('poller did not settle', { error: String(err) });
   }
@@ -176,10 +214,16 @@ async function main(): Promise<void> {
 
   const { server, running } = await build(config, log);
   log.info('github-mcpl starting', {
+    authMode: config.authMode,
     repos: config.repos.map(repoSlug),
     bot: config.botLogin,
     webhook: config.webhookPort === null ? 'off' : `:${config.webhookPort}${config.webhookPath}`,
-    poll: config.pollIntervalMs === 0 ? 'off' : `${config.pollIntervalMs}ms`,
+    poll:
+      config.authMode === 'token'
+        ? `notifications ${config.pollIntervalMs}ms`
+        : config.pollIntervalMs === 0
+          ? 'off'
+          : `${config.pollIntervalMs}ms`,
     state: config.stateFile ?? 'in-memory',
     transport: useStdio ? 'stdio' : `tcp:${tcpPort}`,
   });

@@ -153,8 +153,13 @@ export function tagsFor(event: NormalizedEvent, ctx: GitHubTagContext): TagResul
 
   // ── Addressing: mention, reply, or ambient — never ambient beside either ──
   // Only an event that brings its text counts a mention: a close, a reopen or
-  // new commits re-carry a body the bot already saw when it was written.
-  const mentioned = MENTION_KINDS.has(event.kind) && mentionsBot(event.body, ctx.botLogin);
+  // new commits re-carry a body the bot already saw when it was written. The
+  // server's own `thread.read_failed` notice is addressed to the agent by the
+  // server, so a host that wakes on a mention wakes on it, on a thread the
+  // agent never spoke in too.
+  const mentioned =
+    event.kind === 'thread.read_failed' ||
+    (MENTION_KINDS.has(event.kind) && mentionsBot(event.body, ctx.botLogin));
   const isOwnThread = ctx.isOwnThread === true;
   const isReplyToSelf = ctx.isReplyToSelf === true;
   // The contract: "chat:reply when the event is on a thread the bot authored
@@ -217,6 +222,9 @@ export function tagsFor(event: NormalizedEvent, ctx: GitHubTagContext): TagResul
       break;
     case 'push':
       tags.add('github:push');
+      break;
+    case 'thread.read_failed':
+      tags.add('github:read-failed');
       break;
     case 'comment.created':
     case 'comment.edited':
@@ -318,6 +326,7 @@ export const GITHUB_TAG_ONTOLOGY: TagOntology = {
       facet: 'content',
     },
     'github:push': { desc: 'Commits were pushed to a branch', facet: 'lifecycle' },
+    'github:read-failed': { desc: 'Contributor mode stopped reading a thread until it next moves', facet: 'lifecycle' },
     'github:actor=maintainer': {
       desc: 'The actor is in GITHUB_MAINTAINERS',
       facet: 'sender',

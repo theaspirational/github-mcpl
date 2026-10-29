@@ -183,6 +183,12 @@ const TAG_TABLE: Row[] = [
     event: { sha: 'd'.repeat(40) },
     tags: ['chat:from-human', 'chat:ambient', 'github:push'],
   },
+  {
+    kind: 'thread.read_failed',
+    event: { actor: { login: 'github-mcpl[server]', isBot: true } },
+    // Addressed to the agent by the server, so the advisory's ambient-bot mute can't reach it.
+    tags: ['chat:from-bot', 'chat:mention', 'github:read-failed'],
+  },
 ];
 
 test('the table covers every NormalizedEventKind exactly once', () => {
@@ -222,12 +228,15 @@ const TEXT_KINDS: readonly string[] = [
   'review_comment.edited',
 ];
 
+/** The server's own notices: addressed to the agent by the server, whatever their body says. */
+const SERVER_NOTICE_KINDS: readonly string[] = ['thread.read_failed'];
+
 test('a close, reopen, push or new commits never count the mention in a body they re-carry', () => {
   // The 2026-10-15 rehearsal: a polled issue.closed re-carried the issue's
   // body, and its old mention woke the bot that had just closed it.
   for (const kind of NORMALIZED_EVENT_KINDS) {
     const { tags, metadata } = tagsFor(event(kind, { body: '@rayforce-clone please look' }), ctx());
-    const counts = TEXT_KINDS.includes(kind);
+    const counts = TEXT_KINDS.includes(kind) || SERVER_NOTICE_KINDS.includes(kind);
     assert.equal(tags.includes('chat:mention'), counts, `${kind}: chat:mention`);
     assert.equal(metadata.mentioned, counts, `${kind}: metadata.mentioned`);
   }
@@ -249,8 +258,13 @@ test('chat:ambient never co-occurs with chat:mention or chat:reply, on any kind'
       assert.ok(addressed, `${kind} / ${label}: expected an addressed tag`);
       assert.ok(!tags.includes('chat:ambient'), `${kind} / ${label}: ambient beside addressed`);
     }
-    // And the converse: unaddressed traffic is ambient and nothing else.
+    // And the converse: unaddressed traffic is ambient and nothing else. The
+    // server's own notice is never unaddressed.
     const { tags } = tagsFor(event(kind), ctx());
+    if (SERVER_NOTICE_KINDS.includes(kind)) {
+      assert.ok(tags.includes('chat:mention') && !tags.includes('chat:ambient'), `${kind}: the server addresses it`);
+      continue;
+    }
     assert.ok(tags.includes('chat:ambient'), `${kind}: expected chat:ambient`);
     assert.ok(!tags.includes('chat:mention') && !tags.includes('chat:reply'));
   }

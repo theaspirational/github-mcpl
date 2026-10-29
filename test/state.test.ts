@@ -12,7 +12,7 @@ import { mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { GithubState, ROOT_BUCKET, STATE_VERSION, type GithubStateSnapshot } from '../src/state.js';
+import { GithubState, ROOT_BUCKET, STATE_VERSION, emptySnapshot, type GithubStateSnapshot } from '../src/state.js';
 import { POLL_DEDUP_RING, POLL_HEAD_MEMORY, type Logger } from '../src/types.js';
 
 const REPO = 'anima-research/rayforce';
@@ -429,4 +429,77 @@ test('a checkpoint abandoned by an earlier rollback is refused, not accepted emp
   assert.equal(state.checkpointStatus(a.id), 'live');
   assert.ok(state.rollback(a.id));
   assert.equal(state.checkpointStatus('chk_never'), 'unknown');
+});
+
+test('a notifications watermark that does not read as an instant is dropped on load, with its Last-Modified', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'github-mcpl-state-'));
+  const file = join(dir, 'state.json');
+  const snap = emptySnapshot();
+  writeFileSync(
+    file,
+    JSON.stringify({
+      ...snap,
+      notifications: {
+        since: 'not a time',
+        lastModified: 'Wed, 15 Oct 2026 00:00:00 GMT',
+        retry: [
+          { owner: 'o', name: 'n', number: 1, kind: 'issue', attempts: 2 },
+          { bogus: true },
+          { owner: 'o', name: 'n', number: 0, kind: 'issue', attempts: 0 },
+          { owner: '', name: 'n', number: 2, kind: 'issue', attempts: 0 },
+          { owner: 'o', name: '', number: 4, kind: 'issue', attempts: 0 },
+          { owner: 'o', name: 'n', number: 5, kind: 'issue', attempts: 0, cursor: 7 },
+          { owner: 'o', name: 'n', number: 3, kind: 'pull', attempts: -1000 },
+          { owner: 'o', name: 'n', number: 6, kind: 'pull', attempts: 0, reviewRequest: { id: 'n-6', updatedAt: '2026-10-15T00:09:00Z' } },
+          { owner: 'o', name: 'n', number: 7, kind: 'pull', attempts: 0, reviewRequest: null },
+          { owner: 'o', name: 'n', number: 8, kind: 'pull', attempts: 0, reviewRequest: { id: '', updatedAt: '2026-10-15T00:09:00Z' } },
+          { owner: 'o', name: 'n', number: 9, kind: 'pull', attempts: 0, reviewRequest: { id: 'n-9', updatedAt: 'not a time' } },
+        ],
+      },
+    }),
+  );
+  const state = GithubState.load(file);
+  assert.deepEqual(state.notificationsWatermark(), { since: null, lastModified: null, answeredAt: null });
+  assert.deepEqual(state.notificationRetries(), [
+    { owner: 'o', name: 'n', number: 1, kind: 'issue', attempts: 2 },
+    { owner: 'o', name: 'n', number: 6, kind: 'pull', attempts: 0, reviewRequest: { id: 'n-6', updatedAt: '2026-10-15T00:09:00Z' } },
+  ]);
+});
+
+test('a state file from before the retry list loads with an empty one, its watermark kept', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'github-mcpl-state-'));
+  const file = join(dir, 'state.json');
+  writeFileSync(
+    file,
+    JSON.stringify({ ...emptySnapshot(), notifications: { since: '2026-10-15T00:09:00Z', lastModified: 'Wed, 15 Oct 2026 00:09:00 GMT' } }),
+  );
+  const state = GithubState.load(file);
+  assert.deepEqual(state.notificationsWatermark(), { since: '2026-10-15T00:09:00Z', lastModified: 'Wed, 15 Oct 2026 00:09:00 GMT', answeredAt: null });
+  assert.deepEqual(state.notificationRetries(), []);
+});
+
+test('a stored watermark or answer time that is only loosely a date is dropped on load', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'github-mcpl-state-'));
+  const file = join(dir, 'state.json');
+  writeFileSync(
+    file,
+    JSON.stringify({ ...emptySnapshot(), notifications: { since: '2026-10-15T00:09:00Z', lastModified: null, answeredAt: '12' } }),
+  );
+  assert.equal(GithubState.load(file).notificationsWatermark().answeredAt, null);
+  writeFileSync(file, JSON.stringify({ ...emptySnapshot(), notifications: { since: '12', lastModified: null, answeredAt: null } }));
+  assert.equal(GithubState.load(file).notificationsWatermark().since, null);
+});
+
+test('a retry entry keeps its cursor across a restart', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'github-mcpl-state-'));
+  const file = join(dir, 'state.json');
+  const cursor = ['2026-10-15T00:09:30Z', '2026-10-15T00:09:30Z', 'issue:open:abc', 'issue_comment:5:2026-10-15T00:09:30Z'].join('\u0000');
+  writeFileSync(
+    file,
+    JSON.stringify({
+      ...emptySnapshot(),
+      notifications: { since: '2026-10-15T00:09:00Z', lastModified: null, answeredAt: null, retry: [{ owner: 'o', name: 'n', number: 1, kind: 'issue', attempts: 2, cursor }] },
+    }),
+  );
+  assert.deepEqual(GithubState.load(file).notificationRetries(), [{ owner: 'o', name: 'n', number: 1, kind: 'issue', attempts: 2, cursor }]);
 });

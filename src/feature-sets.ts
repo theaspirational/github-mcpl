@@ -84,6 +84,7 @@ const GITHUB_TAG_DESCRIPTIONS: Record<string, string> = {
   'github:actor': 'Who acted, where the deployment distinguishes them (maintainer).',
   'github:review-comment': 'A comment on a line of a diff, inside a review thread.',
   'github:push': 'Commits were pushed to a branch.',
+  'github:read-failed': 'Contributor mode stopped reading a thread, and says why.',
 };
 
 /** Tag families whose value domain is ordered within this namespace. */

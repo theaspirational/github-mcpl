@@ -8,7 +8,7 @@
  */
 
 import { strict as assert } from 'node:assert';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -286,6 +286,8 @@ test('readConfig refuses a secret file readable by anyone else', () => {
   const dir = mkdtempSync(join(tmpdir(), 'github-mcpl-'));
   const pem = join(dir, 'app.pem');
   writeFileSync(pem, 'NOT-A-REAL-KEY placeholder for tests\n', { mode: 0o644 });
+  // The umask narrows a mode given at creation (a 077 umask makes this 600); chmod sets it as asked.
+  chmodSync(pem, 0o644);
 
   assert.throws(
     () =>

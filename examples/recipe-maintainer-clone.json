@@ -71,6 +71,7 @@
             ],
             "tagsNone": [
               "chat:mention",
+              "github:pr=review_requested",
               "github:ci=failure"
             ]
           },

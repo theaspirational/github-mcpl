@@ -37,6 +37,15 @@ export function repoSlug(repo: RepoRef): string {
   return `${repo.owner}/${repo.name}`;
 }
 
+/** An ISO 8601 instant in UTC as GitHub and this server write them, `2026-10-15T00:09:30Z`, with or without fractional seconds. */
+export function isIsoInstant(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(value) &&
+    Number.isFinite(Date.parse(value))
+  );
+}
+
 /** Parse `owner/name`. Returns null for anything else (no guessing). */
 export function parseRepoSlug(slug: string): RepoRef | null {
   const m = /^([^/\s]+)\/([^/\s]+)$/.exec(slug.trim());
@@ -83,7 +92,8 @@ export type NormalizedEventKind =
   | 'review_comment.created'
   | 'review_comment.edited'
   | 'checks.completed'
-  | 'push';
+  | 'push'
+  | 'thread.read_failed';
 
 export const NORMALIZED_EVENT_KINDS: readonly NormalizedEventKind[] = [
   'issue.opened',
@@ -103,6 +113,7 @@ export const NORMALIZED_EVENT_KINDS: readonly NormalizedEventKind[] = [
   'review_comment.edited',
   'checks.completed',
   'push',
+  'thread.read_failed',
 ] as const;
 
 export type ReviewState = 'approved' | 'changes_requested' | 'commented';
@@ -204,6 +215,8 @@ export interface ChecksSummary {
   conclusion: CheckConclusion | null;
   total: number;
   failed: FailedCheck[];
+  /** Present and true when a run is still going or wasn't read, so a failure isn't yet the sha's last word. */
+  unfinished?: boolean;
 }
 
 export interface PullRequest {
@@ -284,6 +297,12 @@ export interface IssueSearchHit {
   state: IssueState;
   updatedAt: string;
   html_url: string;
+}
+
+/** A search inside one repository: its hits, and how many results GitHub gave from other repositories, left out. */
+export interface IssueSearch {
+  hits: IssueSearchHit[];
+  outside: number;
 }
 
 export type ReviewEvent = 'COMMENT' | 'APPROVE' | 'REQUEST_CHANGES';
@@ -367,6 +386,35 @@ export interface PolledIssue {
    * this, not the author: the bot's own close must come back as from-self.
    */
   closedBy?: EventActor;
+  /**
+   * When it was last closed, from `closed_at`. Contributor mode's
+   * notifications poller reads it for a thread it has no marker for: a close
+   * before that thread's first read starts (five minutes before GitHub's
+   * previous answer to a listing, or, at a first start, five minutes before
+   * W) is old news, one after it is an event.
+   */
+  closedAt?: string;
+  /**
+   * Pull requests only: whether it was merged, from the row's
+   * `pull_request.merged_at`. Absent when the row doesn't say.
+   */
+  merged?: boolean;
+}
+
+/**
+ * One submitted review, newer than the cursor it was fetched with (contributor
+ * mode's notifications poller: `GET pulls/{n}/reviews`, filtered client-side
+ * by `submitted_at` — the endpoint takes no `since`).
+ */
+export interface PolledReview {
+  id: number;
+  author: EventActor;
+  body: string;
+  state: ReviewState;
+  submittedAt: string;
+  html_url: string;
+  /** The commit the review was written against, when GitHub reports one. */
+  commitId?: string;
 }
 
 /** One issue comment or review comment updated since its list's cursor. */
@@ -416,7 +464,12 @@ export interface PollCursor {
 export interface BotIdentity {
   login: string;
   id: number;
-  isBot: true;
+  /**
+   * True for a GitHub App's own identity (`GET /app`). Contributor mode's
+   * `getAuthenticatedBot` answers from `GET /user` instead — a human account,
+   * even though it is the one the server writes as — so this is `false` there.
+   */
+  isBot: boolean;
 }
 
 /**
@@ -431,7 +484,7 @@ export interface GitHubApi {
   listReviewThreads(pull: ThreadRef): Promise<ReviewThread[]>;
   listPullRequestFiles(pull: ThreadRef): Promise<PullRequestFile[]>;
   getCheckRuns(repo: RepoRef, sha: string): Promise<ChecksSummary>;
-  searchIssues(repo: RepoRef, query: string, limit?: number): Promise<IssueSearchHit[]>;
+  searchIssues(repo: RepoRef, query: string, limit?: number): Promise<IssueSearch>;
 
   // ── Comments ──
   createComment(thread: ThreadRef, body: string): Promise<Comment>;
@@ -769,6 +822,7 @@ export const GITHUB_TAGS = [
   'github:ci=success',
   'github:ci=failure',
   'github:push',
+  'github:read-failed',
   'github:actor=maintainer',
 ] as const;
 
@@ -903,7 +957,49 @@ export interface StateSnapshot {
    * recorded here; bounded by {@link POLL_HEAD_MEMORY}.
    */
   pollHeads: Record<string, string>;
+  /**
+   * Contributor mode's notifications watermark: `since`, the instant (ISO) the
+   * notifications list is read from; `lastModified`, the HTTP-date the last
+   * full listing answered, sent back as `If-Modified-Since`; and `answeredAt`,
+   * when GitHub last answered a listing (ISO), a 304 included, where a thread
+   * read for the first time reaches back from. A field of
+   * its own, so a state file kept across a switch of modes never hands App
+   * mode's `lastPollAt` an HTTP-date, or this an ISO instant. A state file
+   * written before it has none: no watermark yet. `retry` is the threads the
+   * poller still owes a read ({@link NotificationRetry}); dropping it would
+   * lose what their failed reads held back.
+   */
+  notifications: NotificationsWatermark & { retry: NotificationRetry[] };
 }
+
+/** {@link StateSnapshot.notifications}: where the next listing starts, and what it sends. */
+export interface NotificationsWatermark {
+  since: string | null;
+  lastModified: string | null;
+  answeredAt: string | null;
+}
+
+/**
+ * A notified thread whose last read or delivery failed, or that GitHub's rate
+ * limit kept from being read: the notifications poller reads it again on each
+ * pass whose listing gets through, listed or not, until it gets through or has
+ * failed {@link NOTIFICATION_RETRY_LIMIT} passes in a row.
+ */
+export interface NotificationRetry {
+  owner: string;
+  name: string;
+  number: number;
+  kind: ThreadKind;
+  /** Passes it has failed in a row. */
+  attempts: number;
+  /** Its cursor as the head memory holds it, kept here too so eviction there can't lose its place while it waits. */
+  cursor?: string;
+  /** A review request listed for it and not yet delivered: the notification's id and `updated_at`, which a later listing won't show again. */
+  reviewRequest?: { id: string; updatedAt: string };
+}
+
+/** How many passes in a row a notified thread may fail before the poller drops it, naming it and the cause. */
+export const NOTIFICATION_RETRY_LIMIT = 5;
 
 /** How many poll keys the dedup ring remembers. */
 export const POLL_DEDUP_RING = 2000;
@@ -945,6 +1041,12 @@ export interface StateStore {
   /** Per list, the rows announced as new in its window (`StateSnapshot.pollNew`). */
   polledNew(): Readonly<Record<string, Record<string, string>>>;
   setPolledNew(rows: Record<string, Record<string, string>>): void;
+  /** Contributor mode's notifications watermark ({@link StateSnapshot.notifications}). */
+  notificationsWatermark(): NotificationsWatermark;
+  setNotificationsWatermark(watermark: { since: string; lastModified: string | null; answeredAt: string | null }): void;
+  /** Contributor mode's threads to read again ({@link NotificationRetry}). */
+  notificationRetries(): NotificationRetry[];
+  setNotificationRetries(retries: NotificationRetry[]): void;
   /** True when the key was already seen; otherwise records it in the ring and returns false. */
   seenPollKey(key: string): boolean;
   /**
@@ -969,27 +1071,56 @@ export const DEFAULT_WEBHOOK_PATH = '/github/webhook';
 export const MIN_POLL_INTERVAL_MS = 60_000;
 
 /**
- * The validated environment. Secret material (`privateKeyPem`,
+ * Which of the two auth + ingress modes a `Config` was validated for:
+ *
+ *   - `app` — the original GitHub App mode: an installation token minted from
+ *     GITHUB_APP_ID/GITHUB_APP_PRIVATE_KEY_FILE, webhook and/or repository
+ *     polling as ingress.
+ *   - `token` — contributor mode: a user's personal access token from
+ *     GITHUB_TOKEN_FILE authenticates every call directly, and the
+ *     notifications poller is the only ingress (no webhook listener).
+ *
+ * `readConfig` picks the mode from which of GITHUB_APP_ID/
+ * GITHUB_APP_PRIVATE_KEY_FILE and GITHUB_TOKEN_FILE are set, and refuses both
+ * at once as ambiguous.
+ */
+export type GithubAuthMode = 'app' | 'token';
+
+/**
+ * The validated environment. Secret material (`privateKeyPem`, `userToken`,
  * `webhookSecret`) is held here and never logged, never put in an error, and
  * never sent to the host.
  */
 export interface Config {
+  authMode: GithubAuthMode;
+  /** App mode only; `''` in contributor mode. */
   appId: string;
-  /** PEM contents of GITHUB_APP_PRIVATE_KEY_FILE. Secret. */
-  privateKeyPem: string;
-  /** Discovered from GITHUB_REPOS when GITHUB_APP_INSTALLATION_ID is absent. */
+  /** PEM contents of GITHUB_APP_PRIVATE_KEY_FILE. Secret. App mode only. */
+  privateKeyPem: string | null;
+  /** Discovered from GITHUB_REPOS when GITHUB_APP_INSTALLATION_ID is absent. App mode only. */
   installationId: number | null;
+  /** Contents of GITHUB_TOKEN_FILE. Secret. Contributor mode only. */
+  userToken: string | null;
   /** Contents of GITHUB_WEBHOOK_SECRET_FILE; present iff `webhookPort` is set. Secret. */
   webhookSecret: string | null;
-  /** Absent = webhook listener off. */
+  /** Absent = webhook listener off. Always absent in contributor mode. */
   webhookPort: number | null;
   webhookPath: string;
-  /** 0 = repository polling off. Never below {@link MIN_POLL_INTERVAL_MS} when on. */
+  /**
+   * App mode: 0 = repository polling off, never below {@link MIN_POLL_INTERVAL_MS}
+   * when on. Contributor mode: the notifications poller's interval, never
+   * below {@link MIN_POLL_INTERVAL_MS} and defaulted to it when unset — the
+   * poller is always on in this mode.
+   */
   pollIntervalMs: number;
   /**
-   * GITHUB_REPOS, the write allow-list. Several repositories are accepted as
-   * long as they share one owner, which is one App installation and so one
-   * token; a second owner is a second server process.
+   * GITHUB_REPOS, the write allow-list. In App mode several repositories are
+   * accepted as long as they share one owner, which is one App installation
+   * and so one token; a second owner is a second server process. In
+   * contributor mode several owners are accepted: the one token authenticates
+   * everywhere the user can reach, and this list bounds what reaches the
+   * agent as well as what it can do: the notifications poller drops threads
+   * from any other repository, and the tools refuse them, reads included.
    */
   repos: RepoRef[];
   /**
@@ -999,6 +1130,7 @@ export interface Config {
    */
   prBaseAllow: string[];
   stateFile: string | null;
+  /** GITHUB_BOT_LOGIN. `''` only in contributor mode when unset: startup sets it to the token's own login. */
   botLogin: string;
   maintainers: string[];
 }
@@ -1008,6 +1140,7 @@ export const ENV_VARS = [
   'GITHUB_APP_ID',
   'GITHUB_APP_PRIVATE_KEY_FILE',
   'GITHUB_APP_INSTALLATION_ID',
+  'GITHUB_TOKEN_FILE',
   'GITHUB_WEBHOOK_SECRET_FILE',
   'GITHUB_WEBHOOK_PORT',
   'GITHUB_WEBHOOK_PATH',
@@ -1110,40 +1243,87 @@ function readPort(name: EnvVar, raw: string | undefined, problems: string[]): nu
 export function readConfig(env: Env = process.env): Config {
   const problems: string[] = [];
 
-  const appId = env.GITHUB_APP_ID?.trim() ?? '';
-  if (!appId) problems.push('GITHUB_APP_ID: required');
-  else if (!/^\d+$/.test(appId)) problems.push(`GITHUB_APP_ID: must be the numeric App id, got "${appId}"`);
+  // ── Which mode: App key, or a contributor's own token ──
+  //
+  // Both present is refused outright, by name, before either is validated any
+  // further: an operator who set both meant one of them and would otherwise
+  // get whichever branch happened to run, silently. Neither present falls
+  // through to the App-mode checks below, which is the mode this server has
+  // always defaulted to and so is what "nothing configured" should keep
+  // naming.
+  const appIdRaw = env.GITHUB_APP_ID?.trim() ?? '';
+  const keyFileRaw = env.GITHUB_APP_PRIVATE_KEY_FILE?.trim() ?? '';
+  const tokenFileRaw = env.GITHUB_TOKEN_FILE?.trim() ?? '';
+  const hasAppVars = appIdRaw !== '' || keyFileRaw !== '';
+  const hasToken = tokenFileRaw !== '';
+  const authMode: GithubAuthMode = hasToken && !hasAppVars ? 'token' : 'app';
 
-  const keyFile = env.GITHUB_APP_PRIVATE_KEY_FILE?.trim() ?? '';
+  if (hasToken && hasAppVars) {
+    problems.push(
+      'GITHUB_TOKEN_FILE: set together with GITHUB_APP_ID/GITHUB_APP_PRIVATE_KEY_FILE; set only one of ' +
+        'App mode (GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY_FILE) or contributor mode (GITHUB_TOKEN_FILE)',
+    );
+  }
+
+  let appId = '';
   let privateKeyPem: string | null = null;
-  if (!keyFile) problems.push('GITHUB_APP_PRIVATE_KEY_FILE: required');
-  else privateKeyPem = readSecretFile('GITHUB_APP_PRIVATE_KEY_FILE', keyFile, problems);
-
   let installationId: number | null = null;
-  const rawInstallation = env.GITHUB_APP_INSTALLATION_ID?.trim();
-  if (rawInstallation) {
-    const n = Number(rawInstallation);
-    if (!Number.isInteger(n) || n <= 0) {
-      problems.push(`GITHUB_APP_INSTALLATION_ID: must be a positive integer, got "${rawInstallation}"`);
+  let userToken: string | null = null;
+
+  if (authMode === 'token') {
+    // A token holds no whitespace, so whitespace or a byte-order mark an
+    // editor left before it goes too. readSecretFile itself keeps leading
+    // bytes, since a webhook secret may begin with a space.
+    userToken = readSecretFile('GITHUB_TOKEN_FILE', tokenFileRaw, problems)?.replace(/^[\uFEFF\s]+/, '') ?? null;
+    if (env.GITHUB_APP_INSTALLATION_ID?.trim()) {
+      problems.push('GITHUB_APP_INSTALLATION_ID: App mode only; contributor mode (GITHUB_TOKEN_FILE) has no installation, so unset it');
+    }
+  } else {
+    if (!appIdRaw) problems.push('GITHUB_APP_ID: required (or set GITHUB_TOKEN_FILE for contributor mode)');
+    else if (!/^\d+$/.test(appIdRaw)) problems.push(`GITHUB_APP_ID: must be the numeric App id, got "${appIdRaw}"`);
+    else appId = appIdRaw;
+
+    if (!keyFileRaw) {
+      problems.push('GITHUB_APP_PRIVATE_KEY_FILE: required (or set GITHUB_TOKEN_FILE for contributor mode)');
     } else {
-      installationId = n;
+      privateKeyPem = readSecretFile('GITHUB_APP_PRIVATE_KEY_FILE', keyFileRaw, problems);
+    }
+
+    const rawInstallation = env.GITHUB_APP_INSTALLATION_ID?.trim();
+    if (rawInstallation) {
+      const n = Number(rawInstallation);
+      if (!Number.isInteger(n) || n <= 0) {
+        problems.push(`GITHUB_APP_INSTALLATION_ID: must be a positive integer, got "${rawInstallation}"`);
+      } else {
+        installationId = n;
+      }
     }
   }
 
-  const webhookPort = readPort('GITHUB_WEBHOOK_PORT', env.GITHUB_WEBHOOK_PORT, problems);
-
-  // Read only when the listener is on: a polling install keeps the example's
-  // GITHUB_WEBHOOK_SECRET_FILE line, and its empty file must not stop startup.
-  const secretFile = env.GITHUB_WEBHOOK_SECRET_FILE?.trim() ?? '';
+  // ── Webhook: App mode only ──
+  let webhookPort: number | null = null;
   let webhookSecret: string | null = null;
-  if (webhookPort === null) {
-    // listener off: no secret is needed, whatever the file holds
-  } else if (secretFile) {
-    webhookSecret = readSecretFile('GITHUB_WEBHOOK_SECRET_FILE', secretFile, problems);
+  if (authMode === 'token') {
+    if (env.GITHUB_WEBHOOK_PORT?.trim()) {
+      problems.push(
+        'GITHUB_WEBHOOK_PORT: not supported in contributor mode (GITHUB_TOKEN_FILE is set); contributor mode ' +
+          'has no webhook listener, only the notifications poller (GITHUB_POLL_INTERVAL_MS)',
+      );
+    }
   } else {
-    problems.push(
-      'GITHUB_WEBHOOK_SECRET_FILE: required when GITHUB_WEBHOOK_PORT is set (a delivery is only trusted after its signature is checked)',
-    );
+    webhookPort = readPort('GITHUB_WEBHOOK_PORT', env.GITHUB_WEBHOOK_PORT, problems);
+    // Read only when the listener is on: a polling install keeps the example's
+    // GITHUB_WEBHOOK_SECRET_FILE line, and its empty file must not stop startup.
+    const secretFile = env.GITHUB_WEBHOOK_SECRET_FILE?.trim() ?? '';
+    if (webhookPort === null) {
+      // listener off: no secret is needed, whatever the file holds
+    } else if (secretFile) {
+      webhookSecret = readSecretFile('GITHUB_WEBHOOK_SECRET_FILE', secretFile, problems);
+    } else {
+      problems.push(
+        'GITHUB_WEBHOOK_SECRET_FILE: required when GITHUB_WEBHOOK_PORT is set (a delivery is only trusted after its signature is checked)',
+      );
+    }
   }
 
   const webhookPath = env.GITHUB_WEBHOOK_PATH?.trim() || DEFAULT_WEBHOOK_PATH;
@@ -1151,9 +1331,25 @@ export function readConfig(env: Env = process.env): Config {
     problems.push(`GITHUB_WEBHOOK_PATH: must start with "/", got "${webhookPath}"`);
   }
 
+  // ── Poll interval: off-by-default in App mode (a webhook fallback), always
+  // on at the floor in contributor mode (its only ingress) ──
   let pollIntervalMs = 0;
   const rawPoll = env.GITHUB_POLL_INTERVAL_MS?.trim();
-  if (rawPoll) {
+  if (authMode === 'token') {
+    if (!rawPoll) {
+      pollIntervalMs = MIN_POLL_INTERVAL_MS;
+    } else {
+      const n = Number(rawPoll);
+      if (!Number.isInteger(n) || n < MIN_POLL_INTERVAL_MS) {
+        problems.push(
+          `GITHUB_POLL_INTERVAL_MS: must be at least ${MIN_POLL_INTERVAL_MS} ms in contributor mode (the ` +
+            `notifications poller is always on), got "${rawPoll}"`,
+        );
+      } else {
+        pollIntervalMs = n;
+      }
+    }
+  } else if (rawPoll) {
     const n = Number(rawPoll);
     if (!Number.isInteger(n) || n < 0) {
       problems.push(`GITHUB_POLL_INTERVAL_MS: must be 0 (off) or a positive integer, got "${rawPoll}"`);
@@ -1181,12 +1377,18 @@ export function readConfig(env: Env = process.env): Config {
     const slugs = repos.map(repoSlug);
     const dup = slugs.find((s, i) => slugs.indexOf(s) !== i);
     if (dup) problems.push(`GITHUB_REPOS: ${dup} is listed twice`);
-    const owners = [...new Set(repos.map((r) => r.owner))];
-    if (owners.length > 1) {
-      problems.push(
-        `GITHUB_REPOS: every repository must share one owner (one App installation, one token); ` +
-          `got ${owners.join(', ')}. Run one server per owner.`,
-      );
+    // App mode: one App installation is one token, so a second owner needs a
+    // second process. Contributor mode's one token already reaches every
+    // owner the user can, so it has no such restriction (the task's
+    // "GITHUB_REPOS may span several owners").
+    if (authMode === 'app') {
+      const owners = [...new Set(repos.map((r) => r.owner))];
+      if (owners.length > 1) {
+        problems.push(
+          `GITHUB_REPOS: every repository must share one owner (one App installation, one token); ` +
+            `got ${owners.join(', ')}. Run one server per owner.`,
+        );
+      }
     }
   }
 
@@ -1203,17 +1405,21 @@ export function readConfig(env: Env = process.env): Config {
     }
   }
 
+  // Contributor mode may leave it unset: startup takes the token's own login
+  // from `GET /user`, which it checks a set value against anyway.
   const botLogin = env.GITHUB_BOT_LOGIN?.trim() ?? '';
-  if (!botLogin) {
+  if (!botLogin && authMode === 'app') {
     problems.push('GITHUB_BOT_LOGIN: required (from-self and mention detection depend on it)');
   }
 
   if (problems.length > 0) throw new ConfigError(problems);
 
   return {
+    authMode,
     appId,
-    privateKeyPem: privateKeyPem as string,
+    privateKeyPem,
     installationId,
+    userToken,
     webhookSecret,
     webhookPort,
     webhookPath,

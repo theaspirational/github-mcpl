@@ -35,7 +35,7 @@ import {
   type ChecksSummary,
   type Comment,
   type Issue,
-  type IssueSearchHit,
+  type IssueSearch,
   type PullRequest,
   type PullRequestFile,
   type RepoRef,
@@ -181,10 +181,14 @@ export function renderFiles(pull: ThreadRef, files: readonly PullRequestFile[]):
   );
 }
 
-export function renderSearchHits(repo: RepoRef, query: string, hits: readonly IssueSearchHit[]): string {
+export function renderSearchHits(repo: RepoRef, query: string, search: IssueSearch): string {
+  const { hits, outside } = search;
   // The query is the caller's own string coming back out: echoed, so bounded.
   const asked = `${field(repoSlug(repo), FIELD.slug)} for ${echo(query, FIELD.query)}`;
-  if (hits.length === 0) return `no matches in ${asked}`;
+  const leftOut =
+    outside > 0 &&
+    `${outside} result${outside === 1 ? '' : 's'} on this page from other repositories left out: a search stays inside ${field(repoSlug(repo), FIELD.slug)}`;
+  if (hits.length === 0) return lines(`no matches in ${asked}`, leftOut);
   return lines(
     `${hits.length} match${hits.length === 1 ? '' : 'es'} in ${asked}`,
     boundedList(
@@ -195,6 +199,7 @@ export function renderSearchHits(repo: RepoRef, query: string, hits: readonly Is
           FIELD.url,
         )}`,
     ),
+    leftOut,
   );
 }
 
@@ -284,7 +289,7 @@ export const readTools: ToolDefinition[] = [
     name: TOOL_SEARCH_ISSUES,
     description:
       'Search issues and pull requests within the allowed repository. Takes GitHub search ' +
-      'syntax without the repo: qualifier, which is added for you.',
+      'syntax; repo:, user:, org: and owner: qualifiers are dropped, since the repository is added for you.',
     inputSchema: {
       type: 'object',
       properties: {

@@ -126,7 +126,7 @@ export function requireReviewThreadId(args: Record<string, unknown>): string {
  *
  * A GraphQL node id names a thread without naming its repository, so checking
  * the `repo` argument proves nothing about the node the call then mutates: a
- * node id from any repository the installation can reach would be resolved —
+ * node id from any repository the token can reach would be resolved —
  * and the confirmation would name the allowed repository, which is worse than
  * failing. So the pull request is named too, and the thread has to be one of
  * *its* threads: the repository allow-list is checked on the pull request

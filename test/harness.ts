@@ -38,6 +38,7 @@ import {
   type EventActor,
   type GitHubApi,
   type Issue,
+  type IssueSearch,
   type IssueSearchHit,
   type PolledComment,
   type PolledIssue,
@@ -284,7 +285,10 @@ export class FakeGitHubApi implements GitHubApi {
     return this.checks.get(`${repoSlug(repo)}@${sha}`) ?? { sha, conclusion: null, total: 0, failed: [] };
   }
 
-  async searchIssues(repo: RepoRef, query: string, limit = LIMITS.listEntries): Promise<IssueSearchHit[]> {
+  /** Results from other repositories the next search reports as left out. */
+  searchOutside = 0;
+
+  async searchIssues(repo: RepoRef, query: string, limit = LIMITS.listEntries): Promise<IssueSearch> {
     this.record('searchIssues', repo, query, limit);
     const needle = query.toLowerCase();
     const hits: IssueSearchHit[] = [];
@@ -300,7 +304,7 @@ export class FakeGitHubApi implements GitHubApi {
         html_url: item.html_url,
       });
     }
-    return hits.slice(0, limit);
+    return { hits: hits.slice(0, limit), outside: this.searchOutside };
   }
 
   // ── Comments ──

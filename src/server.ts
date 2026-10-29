@@ -1280,9 +1280,10 @@ export class GitHubMcplServer {
   // ── The event pipeline ────────────────────────────────────────────────────
 
   /**
-   * Both ingress paths hand every event here: the webhook listener and the
-   * poller take this as their `onEvent`, so one pipeline tags, renders and
-   * forwards whatever arrived, however it arrived.
+   * Every ingress path hands its events here: App mode's webhook listener and
+   * repository poller, and contributor mode's notifications poller, take this
+   * as their `onEvent`, so one pipeline tags, renders and forwards whatever
+   * arrived, however it arrived.
    */
   readonly onEvent = (event: NormalizedEvent): Promise<void> => this.handleEvent(event);
 
@@ -1433,8 +1434,9 @@ export class GitHubMcplServer {
    * What `tagsFor` cannot derive from the event alone.
    *
    * `merged` and `reviewRequestedForSelf` come out of the raw payload the
-   * ingress kept: `pull_request.merged` is the only thing that tells a close
-   * from a merge, and `requested_reviewer.login` the only thing that says
+   * ingress kept: a webhook's `pull_request.merged`, or a polled row's
+   * `merged`, is the only thing that tells a close from a merge, and
+   * `requested_reviewer.login` the only thing that says
    * whether *this* bot was the one asked. `isOwnThread` and `isReplyToSelf`
    * come from the thread's comment history.
    */
@@ -1863,14 +1865,19 @@ function threadFromAddress(address: unknown): ThreadRef | null {
 }
 
 /**
- * `pull_request.merged` out of the raw payload — the only field that tells a
- * merged pull request from a closed one, and it never reaches `tagsFor`
- * (`raw` stays in the pipeline). Undefined means "not known to be merged".
+ * Whether a closed pull request was merged, out of the raw payload: a
+ * webhook's `pull_request.merged`, or a polled row's `merged` (from its
+ * `pull_request.merged_at`). It's the only field that tells a merge from a
+ * close, and it never reaches `tagsFor` (`raw` stays in the pipeline).
+ * Undefined means "not known to be merged".
  */
 function mergedFlag(event: NormalizedEvent): boolean | undefined {
   if (event.kind !== 'pull.closed') return undefined;
   const raw = event.raw;
   if (!raw || typeof raw !== 'object') return undefined;
+  // A polled row (PolledIssue) says it outright; a webhook payload nests it.
+  const polled = (raw as Record<string, unknown>).merged;
+  if (typeof polled === 'boolean') return polled;
   const pull = (raw as Record<string, unknown>).pull_request;
   if (!pull || typeof pull !== 'object') return undefined;
   const merged = (pull as Record<string, unknown>).merged;

@@ -259,8 +259,9 @@ export function oneOf<T extends string>(
 /**
  * The repository a call acts on: the `repo` argument when given, otherwise the
  * single repository GITHUB_REPOS names. A repository outside the allow-list is
- * refused by name — for reads as well as writes, since the installation token
- * could not reach it anyway and a named refusal beats a 404.
+ * refused by name — for reads as well as writes. An installation token could
+ * not reach it anyway, and a user token reaches far past the server's scope,
+ * so in either mode a named refusal is the boundary.
  */
 export function resolveRepo(args: Record<string, unknown>, ctx: ToolContext): RepoRef {
   const allowed = ctx.repos;

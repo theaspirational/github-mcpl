@@ -26,6 +26,7 @@ import {
   type NormalizedEventKind,
   type PolledComment,
   type PolledIssue,
+  type PolledReview,
   type RepoRef,
   type ReviewState,
   type ThreadKind,
@@ -50,10 +51,15 @@ export interface WebhookDelivery {
 }
 
 /**
- * Which `since` query a poll row came from. Part of the dedup key and of the
- * poll event id (`poll:<kind>:<id>:<updated_at>`, contract amendment 1).
+ * Which read a poll row came from. Part of the dedup key and of the poll
+ * event id (`poll:<kind>:<id>:<updated_at>`, contract amendment 1). Each is a
+ * `since` query but two, contributor mode's notifications poller only:
+ * `review`, a submitted review, from a list that takes no `since`, which the
+ * adapter filters by `submitted_at` itself; and `review_requested`, a
+ * notification whose reason is a review request, keyed by the notification's
+ * id and `updated_at`. The repository poll never fetches either.
  */
-export type PollRowKind = 'issue' | 'issue_comment' | 'review_comment' | 'checks';
+export type PollRowKind = 'issue' | 'issue_comment' | 'review_comment' | 'checks' | 'review' | 'review_requested';
 
 /** `<kind>:<id>:<updated_at>` — what `StateStore.seenPollKey` remembers. */
 export function pollKey(kind: PollRowKind, id: number | string, updatedAt: string): string {
@@ -612,6 +618,71 @@ export function normalizePolledComment(
 }
 
 /**
+ * A submitted review from `listReviewsSince` (contributor mode's notifications
+ * poller only — the repository poll has no equivalent, since `since` on this
+ * endpoint is a client-side filter the adapter applies itself). Same shape as
+ * the webhook's `pull_request_review` case in {@link normalizeWebhook}: one
+ * `review.submitted` event with the pull request's title, and the commit the
+ * review was written against where the row names one. The poller reads no
+ * head, so a row without `commit_id` carries no sha, where the webhook would
+ * fall back to the head.
+ */
+export function normalizePolledReview(
+  repo: RepoRef,
+  pull: ThreadRef,
+  row: PolledReview,
+  receivedAt: string,
+  title: string,
+): NormalizedEvent {
+  const key = pollKey('review', row.id, row.submittedAt);
+  const sha = row.commitId;
+  return {
+    id: pollEventId(key),
+    receivedAt,
+    repo,
+    kind: 'review.submitted',
+    thread: pull,
+    actor: row.author,
+    title,
+    body: row.body,
+    html_url: row.html_url,
+    ...(sha === undefined ? {} : { sha }),
+    review: { id: row.id, state: row.state },
+    raw: row,
+  };
+}
+
+/**
+ * A review request, from a `GET /notifications` row whose reason is
+ * `review_requested` (contributor mode's notifications poller only), with the
+ * pull request's row the poller read. The notification names neither who
+ * asked nor whom, so the actor is the pull request's author, who is usually
+ * the one asking, and `raw`, naming no reviewer, makes the server take the
+ * request as the token user's own, which the reason says it is. Keyed by the
+ * notification's id and `updated_at`.
+ */
+export function normalizeNotifiedReviewRequest(
+  repo: RepoRef,
+  row: PolledIssue,
+  notification: { id: string; updatedAt: string },
+  receivedAt: string,
+): NormalizedEvent {
+  const key = pollKey('review_requested', notification.id, notification.updatedAt);
+  return {
+    id: pollEventId(key),
+    receivedAt,
+    repo,
+    kind: 'pull.review_requested',
+    thread: { repo, number: row.number, kind: 'pull' },
+    actor: row.author,
+    title: row.title,
+    body: row.body,
+    html_url: row.html_url,
+    raw: { reason: 'review_requested', notification: notification.id, updatedAt: notification.updatedAt },
+  };
+}
+
+/**
  * The check lifecycle, in one place.
  *
  * A head sha can report its checks many times over — two workflows are two
@@ -650,7 +721,11 @@ export function normalizePolledComment(
 /** A {@link ChecksSummary} whose runs have all finished. */
 export type CompletedChecksSummary = ChecksSummary & { conclusion: CheckConclusion };
 
-/** Have the runs on this sha finished, so that `checks.completed` is true? */
+/**
+ * Is this sha's result decided, so that `checks.completed` is true? Every run
+ * finished, or a failure, which is a failure whatever still runs; the latter
+ * carries `unfinished`, since more failures may come.
+ */
 export function isCompletedSummary(summary: ChecksSummary): summary is CompletedChecksSummary {
   return summary.total > 0 && summary.conclusion !== null;
 }

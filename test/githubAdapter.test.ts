@@ -25,6 +25,10 @@ import {
   GitHubAdapter,
   GitHubApiError,
   POLL_MAX_PAGES,
+  ReadCapError,
+  describeFailure,
+  isLastingFailure,
+  isRateLimit,
   POLL_PR_HEAD_LIMIT,
   REDACTED,
   redactSecrets,
@@ -239,7 +243,12 @@ function defaultRoutes(fake: FakeGitHub, tokenExpiresInMs = 3_600_000, token = T
     .on(`POST ${r}/pulls/12/comments/555/replies`, { status: 201, body: { ...COMMENT_PAYLOAD, id: 556, path: 'a.ts', in_reply_to_id: 555 } })
     .on(`POST ${r}/pulls/12/requested_reviewers`, { status: 201, body: PULL_PAYLOAD })
     .on(`GET ${r}/commits/${HEAD_SHA}/check-runs`, { body: { total_count: 0, check_runs: [] } })
-    .on('GET /search/issues', { body: { total_count: 1, items: [{ ...ISSUE_PAYLOAD, pull_request: { url: 'x' } }] } })
+    .on('GET /search/issues', {
+      body: {
+        total_count: 1,
+        items: [{ ...ISSUE_PAYLOAD, pull_request: { url: 'x' }, repository_url: 'https://api.github.com/repos/anima-research/rayforce' }],
+      },
+    })
     .on(`GET ${r}/issues`, { body: [] })
     .on(`GET ${r}/issues/comments`, { body: [] })
     .on(`GET ${r}/pulls/comments`, { body: [] })
@@ -782,7 +791,8 @@ test('reads hit the documented REST paths and map the payloads', async () => {
 
 test('searchIssues scopes to the repository and drops a caller’s repo: qualifier', async () => {
   const r = await rig();
-  const hits = await r.adapter.searchIssues(REPO, 'repo:someone/else is:open flaky');
+  const { hits, outside } = await r.adapter.searchIssues(REPO, 'repo:someone/else is:open flaky');
+  assert.equal(outside, 0);
 
   assert.deepEqual(hits, [
     {
@@ -831,6 +841,15 @@ test('getCheckRuns rolls a sha’s runs up and lists the failures', async () => 
   // A pull request read folds the same summary in.
   const pull = await r.adapter.getPullRequest(PULL);
   assert.equal(pull.checksSummary?.conclusion, 'failure');
+});
+
+test('summarizeChecks marks a failure beside a run still going, or an unread page, as unfinished, and nothing else', () => {
+  const failed = { name: 'a', status: 'completed', conclusion: 'failure' };
+  const going = summarizeChecks('s', [failed, { name: 'b', status: 'in_progress', conclusion: null }]);
+  assert.equal(going.conclusion, 'failure');
+  assert.equal(going.unfinished, true);
+  assert.equal(summarizeChecks('s', [failed], { total: 600, truncated: true }).unfinished, true);
+  assert.equal('unfinished' in summarizeChecks('s', [failed, { name: 'b', status: 'completed', conclusion: 'success' }]), false);
 });
 
 test('summarizeChecks: running is undecided, all-clear is success, empty is null', () => {
@@ -2031,4 +2050,705 @@ test('retention is by validity, so a credential GitHub would refuse is not kept 
     err.githubMessage.includes(early),
     'a long-expired token is not retained; expiry is what bounds the set',
   );
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contributor mode (user token)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const USER_TOKEN = 'ghp_TESTCONTRIBUTORTOKEN_do_not_log';
+
+function tokenConfig(extra: Record<string, string | undefined> = {}): Config {
+  const dir = mkdtempSync(join(tmpdir(), 'github-mcpl-token-'));
+  const file = join(dir, 'token');
+  writeFileSync(file, `${USER_TOKEN}\n`, { mode: 0o600 });
+  return readConfig({
+    GITHUB_TOKEN_FILE: file,
+    GITHUB_REPOS: 'anima-research/rayforce',
+    GITHUB_BOT_LOGIN: 'a-human',
+    ...extra,
+  });
+}
+
+async function tokenRig(
+  routes: (fake: FakeGitHub) => void = () => {},
+): Promise<{ adapter: GitHubAdapter; fake: FakeGitHub; logs: string[]; sleeps: number[] }> {
+  const fake = new FakeGitHub();
+  routes(fake);
+  await fake.start();
+  const logs: string[] = [];
+  const sleeps: number[] = [];
+  const record = (level: string) => (message: string, fields?: Record<string, unknown>) => {
+    logs.push(`${level} ${message} ${fields ? JSON.stringify(fields) : ''}`);
+  };
+  const logger: Logger = { debug: record('debug'), info: record('info'), warn: record('warn'), error: record('error') };
+  const adapter = new GitHubAdapter(tokenConfig(), {
+    baseUrl: fake.baseUrl,
+    logger,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+    },
+  });
+  after(() => fake.stop());
+  return { adapter, fake, logs, sleeps };
+}
+
+test('contributor mode authenticates every call with the user token, not an installation token', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /repos/anima-research/rayforce/issues/7', { body: ISSUE_PAYLOAD });
+  });
+  await r.adapter.getIssue(ISSUE);
+
+  const call = r.fake.for('GET /repos/anima-research/rayforce/issues/7')[0];
+  assert.equal(call.headers.authorization, `token ${USER_TOKEN}`);
+  // No App endpoint is ever touched: there is no installation to mint for.
+  assert.equal(r.fake.calls.some((c) => c.path.includes('/access_tokens') || c.path === '/app'), false);
+  assert.ok(!r.logs.join('\n').includes(USER_TOKEN), 'the token leaked into a log line');
+});
+
+test('a classic token no pattern knows is still kept out of an error that quotes it', async () => {
+  // An older classic token is 40 hex characters with no prefix, so only the token the adapter holds can find it.
+  const hex = 'a3f9c1e07b2d4c5e8f6a1b2c3d4e5f6a7b8c9d0e';
+  const fake = new FakeGitHub();
+  fake.on('GET /repos/anima-research/rayforce/issues/7', { status: 500, body: { message: `credential ${hex} could not be checked` } });
+  await fake.start();
+  after(() => fake.stop());
+  const file = join(mkdtempSync(join(tmpdir(), 'github-mcpl-token-')), 'token');
+  writeFileSync(file, `${hex}\n`, { mode: 0o600 });
+  const adapter = new GitHubAdapter(
+    readConfig({ GITHUB_TOKEN_FILE: file, GITHUB_REPOS: 'anima-research/rayforce', GITHUB_BOT_LOGIN: 'a-human' }),
+    { baseUrl: fake.baseUrl, sleep: async () => {} },
+  );
+  const err = await adapter.getIssue(ISSUE).then(() => null, (e: unknown) => e);
+  assert.ok(err instanceof GitHubApiError);
+  assert.equal(fake.for('GET /repos/anima-research/rayforce/issues/7')[0].headers.authorization, `token ${hex}`);
+  assert.ok(!err.message.includes(hex), err.message);
+});
+
+test('contributor mode answers getAuthenticatedBot from GET /user, not GET /app', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /user', { body: { login: 'a-human', id: 4242 } });
+  });
+  const identity = await r.adapter.getAuthenticatedBot();
+  assert.deepEqual(identity, { login: 'a-human', id: 4242, isBot: false });
+  assert.equal(r.fake.for('GET /user')[0].headers.authorization, `token ${USER_TOKEN}`);
+});
+
+test('checkTokenLogin names the login to set when GITHUB_BOT_LOGIN isn\'t the token\'s, spelled exactly', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /user', { body: { login: 'a-human', id: 4242 } });
+  });
+  assert.deepEqual(await r.adapter.checkTokenLogin('a-human'), { login: 'a-human', problem: null });
+  const checked = await r.adapter.checkTokenLogin('A-Human');
+  assert.equal(checked.login, null);
+  assert.match(checked.problem ?? '', /set GITHUB_BOT_LOGIN to "a-human", spelled exactly so, or leave it unset/);
+});
+
+test('checkTokenLogin takes an unset GITHUB_BOT_LOGIN from GET /user', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /user', { body: { login: 'a-human', id: 4242 } });
+  });
+  assert.deepEqual(await r.adapter.checkTokenLogin(''), { login: 'a-human', problem: null });
+});
+
+test('checkTokenLogin lets a start go on when GitHub can\'t be reached and the login is set, and says it checked nothing; unset, it can\'t', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /user', { status: 503, body: { message: 'unavailable' } });
+  });
+  assert.deepEqual(await r.adapter.checkTokenLogin('a-human'), { login: 'a-human', problem: null });
+  assert.ok(r.logs.some((line) => line.includes('GITHUB_BOT_LOGIN is unchecked')));
+  const unset = await r.adapter.checkTokenLogin('');
+  assert.equal(unset.login, null);
+  assert.match(unset.problem ?? '', /GITHUB_BOT_LOGIN is unset and GET \/user failed/);
+});
+
+test('contributor mode does not retry a 401: the token cannot be re-minted', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /repos/anima-research/rayforce/issues/7', { status: 401, body: { message: 'Bad credentials' } });
+  });
+  let calls = 0;
+  r.fake.on('GET /repos/anima-research/rayforce/issues/7', () => {
+    calls += 1;
+    return { status: 401, body: { message: 'Bad credentials' } };
+  });
+  await assert.rejects(() => r.adapter.getIssue(ISSUE), GitHubApiError);
+  assert.equal(calls, 1, 'App mode retries a 401 once; contributor mode has nothing to re-mint');
+});
+
+/** A page of `pulls/12/reviews` as GitHub answers it: page 1 names the last page in its `Link` header. */
+function reviewPage(page: number, last: number, rows: unknown[]): Answer {
+  const url = (n: number) => `<https://api.github.com/repositories/1/pulls/12/reviews?per_page=100&page=${n}>`;
+  return { body: rows, headers: page === 1 && last > 1 ? { link: `${url(2)}; rel="next", ${url(last)}; rel="last"` } : {} };
+}
+
+function reviewRows(page: number, submittedAt: string, length = 100): unknown[] {
+  return Array.from({ length }, (_, i) => ({
+    id: page * 1000 + i,
+    user: { login: 'human-one' },
+    body: 'b',
+    state: 'COMMENTED',
+    submitted_at: submittedAt,
+    html_url: `https://x/${page * 1000 + i}`,
+  }));
+}
+
+test('listReviewsSince reads back from the last page to the cursor and answers reviews submitted at or after it, oldest first', async () => {
+  const pull = { repo: REPO, number: 12, kind: 'pull' as const };
+  const r = await tokenRig((fake) => {
+    fake.on(`GET /repos/anima-research/rayforce/pulls/12/reviews`, (req): Answer =>
+      req.query.page === '2'
+        ? reviewPage(2, 2, [
+            { id: 2, user: { login: 'human-two' }, body: 'lgtm', state: 'APPROVED', submitted_at: '2026-10-03T00:00:00Z', html_url: 'https://x/2' },
+            { id: 1, user: { login: 'human-one' }, body: 'nit', state: 'COMMENTED', submitted_at: '2026-10-02T00:00:00Z', html_url: 'https://x/1' },
+          ])
+        : reviewPage(1, 2, reviewRows(1, '2026-10-02T00:00:00Z')),
+    );
+  });
+  const rows = await r.adapter.listReviewsSince(pull, '2026-10-02T00:00:00Z');
+  assert.equal(rows.length, 102, 'every page is new, so both are read');
+  assert.deepEqual(rows.slice(-2).map((row) => row.id), [1, 2], 'the review in the cursor\'s own second is kept; the poller drops a repeat');
+  assert.equal(rows[101].state, 'approved');
+  assert.deepEqual(r.fake.for('GET /repos/anima-research/rayforce/pulls/12/reviews').map((req) => req.query.page), ['1', '2']);
+});
+
+test('listReviewsSince costs a long history nothing: it reads page 1 and back from the last to the cursor, and caps only new reviews', async () => {
+  const pull = { repo: REPO, number: 12, kind: 'pull' as const };
+  // 30 pages of reviews, the last starting before the cursor: only page 1 and page 30 are read.
+  const long = await tokenRig((fake) => {
+    fake.on(`GET /repos/anima-research/rayforce/pulls/12/reviews`, (req): Answer => {
+      const page = Number(req.query.page);
+      if (page !== 30) return reviewPage(page, 30, reviewRows(page, '2026-09-01T00:00:00Z'));
+      return reviewPage(30, 30, [...reviewRows(30, '2026-09-30T00:00:00Z', 40), ...reviewRows(31, '2026-10-05T00:00:00Z', 2)]);
+    });
+  });
+  const rows = await long.adapter.listReviewsSince(pull, '2026-10-01T00:00:00Z');
+  assert.deepEqual(rows.map((row) => row.id), [31000, 31001]);
+  assert.deepEqual(long.fake.for('GET /repos/anima-research/rayforce/pulls/12/reviews').map((req) => req.query.page), ['1', '30']);
+
+  // A list on one page has no Link header: one request.
+  const one = await tokenRig((fake) => {
+    fake.on(`GET /repos/anima-research/rayforce/pulls/12/reviews`, { body: [...reviewRows(1, '2026-09-01T00:00:00Z', 3), ...reviewRows(2, '2026-10-05T00:00:00Z', 1)] });
+  });
+  assert.deepEqual((await one.adapter.listReviewsSince(pull, '2026-10-01T00:00:00Z')).map((row) => row.id), [2000]);
+  assert.equal(one.fake.for('GET /repos/anima-research/rayforce/pulls/12/reviews').length, 1);
+
+  // More than 20 pages holding new reviews is more than one read takes: the read stops at the 21st page back, the first past the cap that holds a new review.
+  const busy = await tokenRig((fake) => {
+    fake.on(`GET /repos/anima-research/rayforce/pulls/12/reviews`, (req): Answer =>
+      reviewPage(Number(req.query.page), 22, reviewRows(Number(req.query.page), '2026-10-05T00:00:00Z')),
+    );
+  });
+  await assert.rejects(() => busy.adapter.listReviewsSince(pull, '2026-10-01T00:00:00Z'), ReadCapError);
+  assert.equal(busy.fake.for('GET /repos/anima-research/rayforce/pulls/12/reviews').length, 22, 'page 1, twenty pages back, and the 21st page back, which holds a new review');
+
+  // Exactly 21 pages: page 1 counts only if it holds a new review.
+  for (const [page1At, fails] of [['2026-10-05T00:00:00Z', true], ['2026-09-01T00:00:00Z', false]] as const) {
+    const edge = await tokenRig((fake) => {
+      fake.on(`GET /repos/anima-research/rayforce/pulls/12/reviews`, (req): Answer => {
+        const page = Number(req.query.page);
+        return reviewPage(page, 21, reviewRows(page, page === 1 ? page1At : '2026-10-05T00:00:00Z'));
+      });
+    });
+    const read = edge.adapter.listReviewsSince(pull, '2026-10-01T00:00:00Z');
+    if (fails) await assert.rejects(read, ReadCapError);
+    else assert.equal((await read).length, 2000, 'twenty pages of new reviews above an old page 1 is one read');
+  }
+
+  // A page past the cap that holds older and newer reviews counts: 22 pages, the cursor inside page 2.
+  const mixed = await tokenRig((fake) => {
+    fake.on(`GET /repos/anima-research/rayforce/pulls/12/reviews`, (req): Answer => {
+      const page = Number(req.query.page);
+      if (page === 1) return reviewPage(1, 22, reviewRows(1, '2026-09-01T00:00:00Z'));
+      if (page === 2) return reviewPage(2, 22, [...reviewRows(2, '2026-09-01T00:00:00Z', 50), ...reviewRows(3000, '2026-10-01T00:00:00Z', 50)]);
+      return reviewPage(page, 22, reviewRows(page, '2026-10-05T00:00:00Z'));
+    });
+  });
+  await assert.rejects(mixed.adapter.listReviewsSince(pull, '2026-10-01T00:00:00Z'), ReadCapError, 'a review in the cursor\'s own second is new');
+
+  // The same edge with the old boundary on page 2 of 22: page 2 is read, and counts only if it holds a new review.
+  for (const [page2At, fails] of [['2026-10-05T00:00:00Z', true], ['2026-09-01T00:00:00Z', false]] as const) {
+    const edge = await tokenRig((fake) => {
+      fake.on(`GET /repos/anima-research/rayforce/pulls/12/reviews`, (req): Answer => {
+        const page = Number(req.query.page);
+        return reviewPage(page, 22, reviewRows(page, page === 1 ? '2026-09-01T00:00:00Z' : page === 2 ? page2At : '2026-10-05T00:00:00Z'));
+      });
+    });
+    const read = edge.adapter.listReviewsSince(pull, '2026-10-01T00:00:00Z');
+    if (fails) await assert.rejects(read, ReadCapError);
+    else assert.equal((await read).length, 2000, 'twenty pages of new reviews above an old page 2 is one read');
+    assert.equal(edge.fake.for('GET /repos/anima-research/rayforce/pulls/12/reviews').length, 22, 'page 1, twenty new pages and page 2');
+  }
+});
+
+test('listReviewsSince fails a page that isn\'t a list, and a Link with a next page but no last', async () => {
+  const pull = { repo: REPO, number: 12, kind: 'pull' as const };
+  const odd = await tokenRig((fake) => {
+    fake.on(`GET /repos/anima-research/rayforce/pulls/12/reviews`, { body: { message: 'not a list' } });
+  });
+  await assert.rejects(
+    () => odd.adapter.listReviewsSince(pull, '2026-10-01T00:00:00Z'),
+    (err: Error) => err.message === 'listReviewsSince: GitHub answered page 1 with something other than a list',
+    'the operation named once',
+  );
+  const byCursor = await tokenRig((fake) => {
+    fake.on(`GET /repos/anima-research/rayforce/pulls/12/reviews`, {
+      body: reviewRows(1, '2026-10-05T00:00:00Z'),
+      headers: { link: '<https://api.github.com/repositories/1/pulls/12/reviews?per_page=100&after=abc>; rel="next"' },
+    });
+  });
+  await assert.rejects(() => byCursor.adapter.listReviewsSince(pull, '2026-10-01T00:00:00Z'), /named a next page but no last page/);
+});
+
+test('listNotifications lists read threads too, since W, every page, with If-Modified-Since on the first page only', async () => {
+  const row = (n: number) => ({
+    id: String(n),
+    updated_at: '2026-10-15T00:00:00Z',
+    reason: 'mention',
+    unread: false,
+    subject: { type: 'Issue', url: `https://api.github.com/repos/anima-research/rayforce/issues/${n}`, title: `#${n}` },
+    repository: { full_name: 'anima-research/rayforce' },
+  });
+  const r = await tokenRig((fake) => {
+    fake.on('GET /notifications', (req): Answer => ({
+      headers: req.query.page === '1' ? { 'last-modified': 'Wed, 15 Oct 2026 00:05:00 GMT', date: 'Wed, 15 Oct 2026 00:05:01 GMT', 'x-poll-interval': '90' } : {},
+      body: req.query.page === '1' ? Array.from({ length: 50 }, (_, i) => row(i + 1)) : [row(51)],
+    }));
+  });
+  const page = await r.adapter.listNotifications({ since: '2026-10-14T00:00:00.000Z', ifModifiedSince: 'Wed, 15 Oct 2026 00:00:00 GMT' });
+  assert.equal(page.notModified, false);
+  assert.equal(page.notifications.length, 51);
+  assert.equal(page.lastModified, 'Wed, 15 Oct 2026 00:05:00 GMT');
+  assert.equal(page.date, 'Wed, 15 Oct 2026 00:05:01 GMT');
+  assert.equal(page.pollIntervalSeconds, 90);
+  const sent = r.fake.for('GET /notifications');
+  assert.deepEqual(
+    sent.map((req) => [req.query.all, req.query.participating, req.query.since, req.query.page, req.headers['if-modified-since'] ?? null]),
+    [
+      ['true', 'true', '2026-10-14T00:00:00.000Z', '1', 'Wed, 15 Oct 2026 00:00:00 GMT'],
+      ['true', 'true', '2026-10-14T00:00:00.000Z', '2', null],
+    ],
+  );
+});
+
+test('listNotifications reports a 304 as notModified, with the 304\'s own headers', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /notifications', { status: 304, headers: { 'last-modified': 'Wed, 15 Oct 2026 00:05:00 GMT', 'x-poll-interval': '120' } });
+  });
+  const page = await r.adapter.listNotifications({ since: '2026-10-14T00:00:00.000Z', ifModifiedSince: 'Wed, 15 Oct 2026 00:05:00 GMT' });
+  assert.equal(page.notModified, true);
+  assert.deepEqual(page.notifications, []);
+  assert.equal(page.lastModified, 'Wed, 15 Oct 2026 00:05:00 GMT');
+  assert.equal(page.pollIntervalSeconds, 120);
+});
+
+test('listNotifications takes the rate-limit retry every call has', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /notifications', (_req, nth): Answer =>
+      nth === 0
+        ? { status: 403, headers: { 'retry-after': '1' }, body: { message: 'You have exceeded a secondary rate limit.' } }
+        : { headers: { 'last-modified': 'Wed, 15 Oct 2026 00:05:00 GMT' }, body: [] },
+    );
+  });
+  const page = await r.adapter.listNotifications({ since: '2026-10-14T00:00:00.000Z', ifModifiedSince: null });
+  assert.equal(page.notModified, false);
+  assert.deepEqual(r.sleeps, [1000]);
+});
+
+test('listNotifications refused for a token that isn\'t classic names the token type it needs', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /notifications', { status: 403, body: { message: 'Resource not accessible by personal access token' } });
+  });
+  const err = await r.adapter.listNotifications({ since: '2026-10-14T00:00:00.000Z', ifModifiedSince: null }).then(
+    () => null,
+    (e: unknown) => e as GitHubApiError,
+  );
+  assert.ok(err instanceof GitHubApiError);
+  assert.equal(err.status, 403);
+  assert.match(err.message, /personal access token \(classic\) only/);
+});
+
+test('listNotifications maps a subject into a repo, kind and number, and drops what it cannot map', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /notifications', {
+      body: [
+        {
+          id: '1',
+          updated_at: '2026-10-15T00:00:00Z',
+          reason: 'mention',
+          unread: true,
+          subject: { type: 'Issue', url: 'https://api.github.com/repos/anima-research/rayforce/issues/7', title: 'A bug' },
+          repository: { full_name: 'anima-research/rayforce' },
+        },
+        {
+          id: '2',
+          updated_at: '2026-10-15T00:00:00Z',
+          reason: 'subscribed',
+          unread: true,
+          subject: { type: 'Discussion', url: null, title: 'off-topic' },
+          repository: { full_name: 'anima-research/rayforce' },
+        },
+        {
+          id: '3',
+          updated_at: '2026-10-15T00:00:00Z',
+          reason: 'author',
+          unread: false,
+          subject: { type: 'PullRequest', url: 'https://api.github.com/repos/anima-research/rayforce/pulls/12', title: 'Fix it' },
+          repository: { full_name: 'anima-research/rayforce' },
+        },
+      ],
+    });
+  });
+  const page = await r.adapter.listNotifications({ since: '2026-10-14T00:00:00.000Z', ifModifiedSince: null });
+  assert.equal(page.notifications.length, 2);
+  assert.deepEqual([page.notifications[1].kind, page.notifications[1].number], ['pull', 12]);
+  assert.deepEqual(page.notifications[0], {
+    id: '1',
+    updatedAt: '2026-10-15T00:00:00Z',
+    reason: 'mention',
+    unread: true,
+    repo: { owner: 'anima-research', name: 'rayforce' },
+    kind: 'issue',
+    number: 7,
+    title: 'A bug',
+  });
+});
+
+test('getPolledThread reads only the issues endpoint: state, close time and closer, whether a pull request was merged, and no head', async () => {
+  const pull = { repo: REPO, number: 12, kind: 'pull' as const };
+  const r = await tokenRig((fake) => {
+    fake.on('GET /repos/anima-research/rayforce/issues/12', {
+      body: {
+        id: 9012,
+        number: 12,
+        title: 'Fix it',
+        body: 'the fix',
+        state: 'open',
+        user: { login: 'agent' },
+        created_at: '2026-10-01T00:00:00Z',
+        updated_at: '2026-10-15T00:00:00Z',
+        html_url: 'https://github.com/anima-research/rayforce/pull/12',
+        pull_request: { merged_at: null },
+      },
+    });
+    fake.on('GET /repos/anima-research/rayforce/issues/14', {
+      body: {
+        id: 9014,
+        number: 14,
+        title: 'Fix more',
+        body: '',
+        state: 'closed',
+        user: { login: 'agent' },
+        created_at: '2026-10-01T00:00:00Z',
+        updated_at: '2026-10-15T00:00:00Z',
+        closed_at: '2026-10-15T00:00:00Z',
+        closed_by: { login: 'maintainer' },
+        html_url: 'https://github.com/anima-research/rayforce/pull/14',
+        pull_request: { merged_at: '2026-10-15T00:00:00Z' },
+      },
+    });
+    fake.on('GET /repos/anima-research/rayforce/issues/7', {
+      body: {
+        id: 9007,
+        number: 7,
+        title: 'A bug',
+        body: '',
+        state: 'closed',
+        user: { login: 'agent' },
+        created_at: '2026-10-01T00:00:00Z',
+        updated_at: '2026-10-15T00:00:00Z',
+        closed_at: '2026-10-15T00:00:00Z',
+        closed_by: { login: 'maintainer' },
+        html_url: 'https://github.com/anima-research/rayforce/issues/7',
+      },
+    });
+  });
+  const open = await r.adapter.getPolledThread(pull);
+  assert.equal(open.isPullRequest, true);
+  assert.equal(open.headSha, undefined);
+  assert.equal(open.merged, false);
+  const merged = await r.adapter.getPolledThread({ repo: REPO, number: 14, kind: 'pull' });
+  assert.equal(merged.merged, true);
+  const closed = await r.adapter.getPolledThread(ISSUE);
+  assert.equal(closed.closedAt, '2026-10-15T00:00:00Z');
+  assert.equal(closed.closedBy?.login, 'maintainer');
+  assert.equal(closed.merged, undefined, 'an issue says nothing of a merge');
+  assert.deepEqual(r.fake.for('GET /repos/anima-research/rayforce/pulls/12'), [], 'an open pull request\'s head is not read');
+});
+
+test('listCommentsSince and listPullReviewCommentsSince read one thread\'s rows since its cursor, every page', async () => {
+  const pull = { repo: REPO, number: 12, kind: 'pull' as const };
+  const rowsOf = (page: string | undefined, base: number) =>
+    Array.from({ length: page === '2' ? 3 : 100 }, (_, i) => ({
+      id: base + (page === '2' ? 100 : 0) + i,
+      user: { login: 'human-one' },
+      body: 'b',
+      created_at: '2026-10-15T00:00:00Z',
+      updated_at: '2026-10-15T00:00:00Z',
+      html_url: 'https://x',
+    }));
+  const r = await tokenRig((fake) => {
+    fake.on('GET /repos/anima-research/rayforce/issues/7/comments', (req): Answer => ({ body: rowsOf(req.query.page, 1000) }));
+    fake.on('GET /repos/anima-research/rayforce/pulls/12/comments', (req): Answer => ({ body: rowsOf(req.query.page, 5000) }));
+  });
+  const comments = await r.adapter.listCommentsSince(ISSUE, '2026-10-14T00:00:00Z');
+  assert.equal(comments.length, 103);
+  assert.ok(comments.every((c) => c.number === 7));
+  const reviewComments = await r.adapter.listPullReviewCommentsSince(pull, '2026-10-14T00:00:00Z');
+  assert.equal(reviewComments.length, 103);
+  assert.ok(reviewComments.every((c) => c.number === 12));
+  const sent = r.fake.for('GET /repos/anima-research/rayforce/pulls/12/comments')[0].query;
+  assert.deepEqual([sent.since, sent.sort, sent.direction], ['2026-10-14T00:00:00Z', 'updated', 'asc']);
+  assert.equal(r.fake.for('GET /repos/anima-research/rayforce/issues/7/comments')[0].query.since, '2026-10-14T00:00:00Z');
+});
+
+test('isLastingFailure: gone or out of reach is lasting; a rate limit, a server error or a network failure passes', () => {
+  assert.equal(isLastingFailure(new GitHubApiError(404, 'Not Found', 'getPolledThread')), true);
+  assert.equal(isLastingFailure(new GitHubApiError(410, 'Gone', 'getPolledThread')), true);
+  assert.equal(isLastingFailure(new GitHubApiError(403, 'Resource not accessible by personal access token', 'getPolledThread')), true);
+  assert.equal(isLastingFailure(new GitHubApiError(403, 'You have exceeded a secondary rate limit.', 'getPolledThread')), false);
+  assert.equal(isLastingFailure(new GitHubApiError(403, 'API rate limit exceeded for user.', 'getPolledThread')), false);
+  assert.equal(isLastingFailure(new GitHubApiError(502, 'Bad gateway', 'getPolledThread')), false);
+  assert.equal(isLastingFailure(new Error('socket hang up')), false);
+});
+
+test('checkTokenLogin refuses a start whose token GitHub refuses, the login set or not', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /user', { status: 401, body: { message: 'Bad credentials' } });
+  });
+  assert.match((await r.adapter.checkTokenLogin('a-human')).problem ?? '', /GET \/user refused the token in GITHUB_TOKEN_FILE/);
+  assert.match((await r.adapter.checkTokenLogin('')).problem ?? '', /GET \/user refused the token in GITHUB_TOKEN_FILE, so its login is unknown/);
+});
+
+test('listNotifications reads a page past its cap only to learn whether there was more', async () => {
+  const row = (n: number) => ({
+    id: String(n),
+    updated_at: '2026-10-15T00:00:00Z',
+    reason: 'mention',
+    unread: false,
+    subject: { type: 'Issue', url: `https://api.github.com/repos/anima-research/rayforce/issues/${n}`, title: `#${n}` },
+    repository: { full_name: 'anima-research/rayforce' },
+  });
+  const full = (page: number) => Array.from({ length: 50 }, (_, i) => row(page * 100 + i));
+  const exact = await tokenRig((fake) => {
+    fake.on('GET /notifications', (req): Answer => ({ body: Number(req.query.page) <= 20 ? full(Number(req.query.page)) : [] }));
+  });
+  const complete = await exact.adapter.listNotifications({ since: '2026-10-14T00:00:00Z', ifModifiedSince: null });
+  assert.equal(complete.notifications.length, 1000);
+  assert.equal(complete.truncated, false, 'twenty full pages and an empty twenty-first is the whole list');
+
+  const more = await tokenRig((fake) => {
+    fake.on('GET /notifications', (req): Answer => ({ body: full(Number(req.query.page)) }));
+  });
+  const capped = await more.adapter.listNotifications({ since: '2026-10-14T00:00:00Z', ifModifiedSince: null });
+  assert.equal(capped.notifications.length, 1000);
+  assert.equal(capped.truncated, true);
+  assert.equal(more.fake.for('GET /notifications').length, 21);
+});
+
+test('checkTokenLogin: a 403 that isn\'t a rate limit refuses the start; a rate-limited one lets it go on, unchecked', async () => {
+  const refused = await tokenRig((fake) => {
+    fake.on('GET /user', { status: 403, body: { message: 'Resource not accessible by personal access token' } });
+  });
+  assert.match((await refused.adapter.checkTokenLogin('a-human')).problem ?? '', /GET \/user refused the token in GITHUB_TOKEN_FILE/);
+
+  const limited = await tokenRig((fake) => {
+    fake.on('GET /user', { status: 403, body: { message: 'API rate limit exceeded for user ID 1.' } });
+  });
+  assert.deepEqual(await limited.adapter.checkTokenLogin('a-human'), { login: 'a-human', problem: null });
+  assert.ok(limited.logs.some((line) => line.includes('GITHUB_BOT_LOGIN is unchecked')));
+});
+
+test('listOwnOpenPulls asks one search for the user\'s open pull requests in GITHUB_REPOS, and keeps only those', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /search/issues', {
+      body: {
+        items: [
+          { number: 12, updated_at: '2026-10-15T00:09:00Z', html_url: 'https://github.com/anima-research/rayforce/pull/12', repository_url: 'https://api.github.com/repos/Anima-Research/rayforce', pull_request: {} },
+          { number: 13, updated_at: '2026-10-15T00:08:00Z', html_url: 'https://github.com/someone/else/pull/13', repository_url: 'https://api.github.com/repos/someone/else', pull_request: {} },
+          { number: 14, updated_at: '2026-10-15T00:07:00Z', html_url: 'https://github.com/anima-research/rayforce/issues/14', repository_url: 'https://api.github.com/repos/anima-research/rayforce' },
+        ],
+      },
+    });
+  });
+  const repos = [{ owner: 'anima-research', name: 'rayforce' }];
+  assert.deepEqual(await r.adapter.listOwnOpenPulls('a-human', repos), [
+    { repo: repos[0], number: 12, updatedAt: '2026-10-15T00:09:00Z', html_url: 'https://github.com/anima-research/rayforce/pull/12' },
+  ]);
+  const call = r.fake.for('GET /search/issues')[0];
+  assert.equal(call.query.q, 'is:pr is:open author:a-human repo:anima-research/rayforce');
+  assert.equal(call.query.sort, 'updated');
+});
+
+test('getPullHeadSha reads the pull request alone, with no check runs', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /repos/anima-research/rayforce/pulls/12', { body: { number: 12, head: { sha: 'abc123', ref: 'fix' } } });
+  });
+  assert.equal(await r.adapter.getPullHeadSha({ repo: { owner: 'anima-research', name: 'rayforce' }, number: 12, kind: 'pull' }), 'abc123');
+  assert.equal(r.fake.calls.some((c) => c.path.includes('check-runs')), false);
+  const headless = await tokenRig((fake) => {
+    fake.on('GET /repos/anima-research/rayforce/pulls/12', { body: { number: 12, head: {} } });
+  });
+  await assert.rejects(
+    () => headless.adapter.getPullHeadSha({ repo: { owner: 'anima-research', name: 'rayforce' }, number: 12, kind: 'pull' }),
+    (err: Error) => err.message === 'getPullHeadSha: GitHub answered with no head sha',
+    'the operation named once',
+  );
+});
+
+test('isRateLimit: a 429, or a 403 that says rate limit; nothing else', () => {
+  assert.equal(isRateLimit(new GitHubApiError(429, 'Too Many Requests', 'listCommentsSince')), true);
+  assert.equal(isRateLimit(new GitHubApiError(403, 'You have exceeded a secondary rate limit.', 'listCommentsSince')), true);
+  assert.equal(isRateLimit(new GitHubApiError(403, 'Resource not accessible by personal access token', 'listCommentsSince')), false);
+  assert.equal(isRateLimit(new GitHubApiError(502, 'Bad gateway', 'listCommentsSince')), false);
+  assert.equal(isRateLimit(new Error('socket hang up')), false);
+});
+
+test('describeFailure says GitHub answered only when it did', () => {
+  assert.equal(describeFailure(new GitHubApiError(502, 'Bad gateway', 'getPolledThread')), 'GitHub answered 502: Bad gateway');
+  assert.equal(describeFailure(new GitHubApiError(500, 'fetch failed', 'getPolledThread', false, false)), 'the request to GitHub failed: fetch failed');
+  assert.equal(describeFailure(new GitHubApiError(0, 'GitHub answered page 2 with something other than a list', 'listCommentsSince')), 'GitHub answered page 2 with something other than a list');
+  assert.equal(describeFailure(new Error('socket hang up')), 'the request to GitHub failed: socket hang up');
+  assert.equal(new GitHubApiError(0, 'x', 'listCommentsSince').message, 'listCommentsSince: x', 'no "GitHub 0"');
+});
+
+test('listNotifications: a page past the cap with any row, or one that fails, marks the listing truncated, which still answers with what was listed', async () => {
+  const row = (n: number) => ({
+    id: String(n),
+    updated_at: '2026-10-15T00:00:00Z',
+    reason: 'mention',
+    unread: false,
+    subject: { type: 'Issue', url: `https://api.github.com/repos/anima-research/rayforce/issues/${n}`, title: `#${n}` },
+    repository: { full_name: 'anima-research/rayforce' },
+  });
+  const full = (page: number) => Array.from({ length: 50 }, (_, i) => row(page * 100 + i));
+  const failing = await tokenRig((fake) => {
+    fake.on('GET /notifications', (req): Answer =>
+      Number(req.query.page) <= 20 ? { body: full(Number(req.query.page)) } : { status: 502, body: { message: 'Bad gateway' } },
+    );
+  });
+  const page = await failing.adapter.listNotifications({ since: '2026-10-14T00:00:00Z', ifModifiedSince: null });
+  assert.equal(page.notifications.length, 1000);
+  assert.equal(page.truncated, true, 'a probe that fails may have hidden more');
+
+  const unmappable = await tokenRig((fake) => {
+    fake.on('GET /notifications', (req): Answer =>
+      Number(req.query.page) <= 20
+        ? { body: full(Number(req.query.page)) }
+        : { body: [{ ...row(1), subject: { type: 'Discussion', url: null, title: 'off-topic' } }] },
+    );
+  });
+  const rest = await unmappable.adapter.listNotifications({ since: '2026-10-14T00:00:00Z', ifModifiedSince: null });
+  assert.equal(rest.notifications.length, 1000);
+  assert.equal(rest.truncated, true, 'a row the poller can\'t read may still be followed by ones it can');
+
+  const readable = await tokenRig((fake) => {
+    fake.on('GET /notifications', (req): Answer => ({ body: Number(req.query.page) <= 20 ? full(Number(req.query.page)) : [row(9999)] }));
+  });
+  assert.equal((await readable.adapter.listNotifications({ since: '2026-10-14T00:00:00Z', ifModifiedSince: null })).truncated, true);
+});
+
+test('a per-thread read takes exactly 2,000 rows whole, fails past them, and fails a page that isn\'t a list', async () => {
+  const rows = (page: number, length = 100) =>
+    Array.from({ length }, (_, i) => ({
+      id: page * 1000 + i,
+      user: { login: 'human-one' },
+      body: 'b',
+      created_at: '2026-10-15T00:00:00Z',
+      updated_at: '2026-10-15T00:00:00Z',
+      html_url: 'https://x',
+    }));
+  const exact = await tokenRig((fake) => {
+    fake.on('GET /repos/anima-research/rayforce/issues/7/comments', (req): Answer => ({ body: Number(req.query.page) <= 20 ? rows(Number(req.query.page)) : [] }));
+  });
+  assert.equal((await exact.adapter.listCommentsSince(ISSUE, '2026-10-14T00:00:00Z')).length, 2000);
+
+  const more = await tokenRig((fake) => {
+    fake.on('GET /repos/anima-research/rayforce/issues/7/comments', (req): Answer => ({ body: rows(Number(req.query.page)) }));
+  });
+  await assert.rejects(
+    () => more.adapter.listCommentsSince(ISSUE, '2026-10-14T00:00:00Z'),
+    (err: unknown) =>
+      err instanceof ReadCapError && err.message === 'listCommentsSince: more than 2000 comments or reviews to read at once',
+  );
+
+  const odd = await tokenRig((fake) => {
+    fake.on('GET /repos/anima-research/rayforce/issues/7/comments', { body: { message: 'not a list' } });
+  });
+  await assert.rejects(
+    () => odd.adapter.listCommentsSince(ISSUE, '2026-10-14T00:00:00Z'),
+    (err: Error) => err.message === 'listCommentsSince: GitHub answered page 1 with something other than a list',
+    'the operation named once',
+  );
+});
+
+test('searchIssues drops every repo:, user:, org: and owner: qualifier, so the search stays in the one repository', async () => {
+  // A negated one goes too: an owner exclusion inside one repository excludes all of it or nothing, so
+  // dropping it loses no useful exclusion, and the scrub stays one pattern.
+  for (const qualifier of ['repo:someone/else', 'user:someone', 'org:someone', 'owner:someone', '-user:someone', 'USER:someone']) {
+    const r = await rig();
+    await r.adapter.searchIssues(REPO, `is:open ${qualifier} flaky`);
+    assert.equal(r.fake.for('GET /search/issues')[0].query.q, 'repo:anima-research/rayforce is:open flaky', qualifier);
+  }
+  // GitHub reads a qualifier right after a quote or a bracket too: `"x"user:octocat` widened a live search.
+  for (const [query, sent] of [
+    ['"x"user:someone flaky', 'repo:anima-research/rayforce "x" flaky'],
+    ['(user:someone) flaky', 'repo:anima-research/rayforce ( ) flaky'],
+    ['flaky (bug org:someone)', 'repo:anima-research/rayforce flaky (bug )'],
+  ] as const) {
+    const r = await rig();
+    await r.adapter.searchIssues(REPO, query);
+    assert.equal(r.fake.for('GET /search/issues')[0].query.q, sent, query);
+  }
+});
+
+test('searchIssues leaves out, and counts, any result from another repository; GitHub\'s spelling of this one is kept', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /search/issues', {
+      body: {
+        total_count: 3,
+        items: [
+          { ...ISSUE_PAYLOAD, number: 7, repository_url: 'https://api.github.com/repos/Anima-Research/Rayforce' },
+          { ...ISSUE_PAYLOAD, number: 8, repository_url: 'https://api.github.com/repos/someone/private-thing' },
+          { ...ISSUE_PAYLOAD, number: 9 },
+        ],
+      },
+    });
+  });
+  const { hits, outside } = await r.adapter.searchIssues(REPO, 'flaky');
+  assert.deepEqual(hits.map((h) => h.number), [7]);
+  assert.equal(outside, 2, 'one from another repository, and one that names none');
+});
+
+test('repoSpellingProblems names an entry GitHub spells otherwise, and one the token can\'t see; GitHub not answering checks nothing', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /repos/anima-research/rayforce', { body: { full_name: 'anima-research/rayforce' } });
+    fake.on('GET /repos/the-glassy/github-mcpl', { body: { full_name: 'The-Glassy/github-mcpl' } });
+    fake.on('GET /repos/someone/gone', { status: 404, body: { message: 'Not Found' } });
+    fake.on('GET /repos/someone/busy', { status: 502, body: { message: 'Bad gateway' } });
+  });
+  const problems = await r.adapter.repoSpellingProblems([
+    { owner: 'anima-research', name: 'rayforce' },
+    { owner: 'the-glassy', name: 'github-mcpl' },
+    { owner: 'someone', name: 'gone' },
+    { owner: 'someone', name: 'busy' },
+  ]);
+  assert.deepEqual(problems, [
+    'GITHUB_REPOS names "the-glassy/github-mcpl", but GitHub spells it "The-Glassy/github-mcpl": set it to "The-Glassy/github-mcpl", spelled exactly so',
+    'GITHUB_REPOS names "someone/gone", which the token in GITHUB_TOKEN_FILE can\'t see (GitHub answered 404: Not Found)',
+  ]);
+  assert.ok(r.logs.some((line) => line.includes('unchecked against GitHub') && line.includes('someone/busy')));
+});
+
+test('a request that fails before GitHub answers is told apart from an answer', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /repos/anima-research/rayforce/issues/7', { body: {} });
+  });
+  await r.fake.stop();
+  const err = await r.adapter.getPolledThread(ISSUE).then(
+    () => null,
+    (e: unknown) => e,
+  );
+  assert.ok(err instanceof GitHubApiError, String(err));
+  assert.equal(err.answered, false);
+  assert.match(describeFailure(err), /^the request to GitHub failed: /);
 });

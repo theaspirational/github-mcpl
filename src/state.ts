@@ -20,7 +20,9 @@
  *     dedup ring of the last {@link POLL_DEDUP_RING} poll keys (contract
  *     amendment 1), and the last
  *     polled head sha of each open pull request, bounded by
- *     {@link POLL_HEAD_MEMORY} (amendment 2a).
+ *     {@link POLL_HEAD_MEMORY} (amendment 2a);
+ *   - contributor mode's notifications watermark, apart from `lastPollAt`,
+ *     and each notified thread's cursor, in the same bounded head memory.
  *
  * **Which checkpoint a write lands under.** A tool records its write under
  * `current()`, and the routing layer creates a checkpoint *after* the call and
@@ -37,6 +39,7 @@ import { mkdirSync, readFileSync } from 'node:fs';
 import { open, rename } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import {
+  isIsoInstant,
   POLL_DEDUP_RING,
   POLL_HEAD_MEMORY,
   silentLogger,
@@ -46,6 +49,8 @@ import {
   type EditedComment,
   type Logger,
   type PollCursor,
+  type NotificationRetry,
+  type NotificationsWatermark,
   type RollbackPlan,
   type StateSnapshot,
   type StateStore,
@@ -145,6 +150,7 @@ export function emptySnapshot(): GithubStateSnapshot {
     pollNew: {},
     pollKeys: [],
     pollHeads: {},
+    notifications: { since: null, lastModified: null, answeredAt: null, retry: [] },
   };
 }
 
@@ -339,6 +345,28 @@ export class GithubState implements GithubStateStore {
     this.snap.pollNew = rows;
   }
 
+  notificationsWatermark(): NotificationsWatermark {
+    const { since, lastModified, answeredAt } = this.snap.notifications;
+    return { since, lastModified, answeredAt };
+  }
+
+  setNotificationsWatermark(watermark: { since: string; lastModified: string | null; answeredAt: string | null }): void {
+    this.snap.notifications = {
+      ...this.snap.notifications,
+      since: watermark.since,
+      lastModified: watermark.lastModified,
+      answeredAt: watermark.answeredAt,
+    };
+  }
+
+  notificationRetries(): NotificationRetry[] {
+    return this.snap.notifications.retry.map((r) => ({ ...r }));
+  }
+
+  setNotificationRetries(retries: NotificationRetry[]): void {
+    this.snap.notifications = { ...this.snap.notifications, retry: retries.map((r) => ({ ...r })) };
+  }
+
   seenPollKey(key: string): boolean {
     if (this.snap.pollKeys.includes(key)) return true;
     this.snap.pollKeys.push(key);
@@ -436,6 +464,20 @@ function normalize(parsed: unknown): GithubStateSnapshot | null {
   // Additive since amendment 2a, so a state file written before it is still a
   // valid version-1 snapshot: an absent map just means no head is known yet.
   snap.pollHeads = strings(raw.pollHeads);
+  // Additive with contributor mode: a state file without it has no watermark.
+  // A `since` or `answeredAt` that doesn't read as an instant is dropped
+  // rather than sent to GitHub, or reached back from, on every pass.
+  const notifications = raw.notifications as
+    | (Partial<NotificationsWatermark> & { retry?: unknown })
+    | undefined;
+  const instant = (value: unknown): string | null => (isIsoInstant(value) ? value : null);
+  const since = instant(notifications?.since);
+  snap.notifications = {
+    since,
+    lastModified: since !== null && typeof notifications?.lastModified === 'string' ? notifications.lastModified : null,
+    answeredAt: since !== null ? instant(notifications?.answeredAt) : null,
+    retry: Array.isArray(notifications?.retry) ? notifications.retry.filter(isNotificationRetry) : [],
+  };
   return snap;
 }
 
@@ -456,6 +498,28 @@ function cursors(raw: unknown): Record<string, PollCursor> {
     out[key] = instant(resumeAt) ? { since, resumeAt } : { since };
   }
   return out;
+}
+
+function isNotificationRetry(raw: unknown): raw is NotificationRetry {
+  const r = raw as Partial<NotificationRetry> | null;
+  return (
+    !!r &&
+    typeof r.owner === 'string' &&
+    r.owner !== '' &&
+    typeof r.name === 'string' &&
+    r.name !== '' &&
+    Number.isInteger(r.number) &&
+    (r.number as number) > 0 &&
+    (r.kind === 'issue' || r.kind === 'pull') &&
+    Number.isInteger(r.attempts) &&
+    (r.attempts as number) >= 0 &&
+    (r.cursor === undefined || typeof r.cursor === 'string') &&
+    (r.reviewRequest === undefined ||
+      (!!r.reviewRequest &&
+        typeof r.reviewRequest.id === 'string' &&
+        r.reviewRequest.id !== '' &&
+        isIsoInstant(r.reviewRequest.updatedAt)))
+  );
 }
 
 /** A `Record<string, string>` from untrusted JSON; non-string values dropped. */

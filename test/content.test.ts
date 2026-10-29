@@ -147,6 +147,7 @@ const RENDER_TABLE: Array<{ kind: NormalizedEvent['kind']; event?: Partial<Norma
     },
   },
   { kind: 'push', event: { sha: 'd'.repeat(40) } },
+  { kind: 'thread.read_failed', event: { body: 'github-mcpl stopped reading this thread.' } },
 ];
 
 test('the render table covers every NormalizedEventKind exactly once', () => {
