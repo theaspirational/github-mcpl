@@ -200,6 +200,7 @@ async function main(): Promise<void> {
       const tcpServer = net.createServer();
       tcpServer.listen(tcpPort, '127.0.0.1');
       await new Promise<void>((resolve) => tcpServer.once('listening', resolve));
+      tcpServer.on('error', (err) => log.error('tcp server error', { error: String(err) }));
       log.info('listening', { tcpPort });
       // One host at a time: the grant, the channel registry and the thread
       // memory are per-connection, and a second concurrent peer would be

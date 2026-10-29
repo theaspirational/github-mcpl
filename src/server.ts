@@ -656,6 +656,7 @@ export class GitHubMcplServer {
    * registry (registration is per-host, §14.5) and the thread memory.
    */
   async serve(conn: McplConnection): Promise<void> {
+    conn.on('error', (err) => this.logger.error('connection error', { error: String(err) }));
     this.conn = conn;
     this.grant.reset();
     this.channels = new ChannelRegistry({

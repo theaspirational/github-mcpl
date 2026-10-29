@@ -433,12 +433,12 @@ function isFatal(err) {
  * Did this command fail because the server is no longer there?
  *
  * The stream closing usually beats the `exit` event, so a child that dies
- * under a command surfaces as mcpl-core's `Connection closed` rather than as
+ * under a command surfaces as mcpl-core's `ConnectionClosedError` rather than as
  * the exit this host is watching for. Both mean the same thing, and both have
  * to stop the run: every command after them would report it again.
  */
 function isGone(err) {
-  return err?.fatal === true || /connection closed/i.test(String(err?.message ?? err));
+  return err?.fatal === true || err?.name === 'ConnectionClosedError';
 }
 
 /** Wait briefly for the child's exit, so a failure can name its code. */
