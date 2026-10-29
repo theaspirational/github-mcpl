@@ -1746,18 +1746,25 @@ export class GitHubAdapter implements GitHubApi {
         return { rows: res.data as ApiReview[], last: lastPageOf((res.headers as Record<string, string | undefined>).link) };
       });
     const first = await read(1);
-    const last = first.last;
-    if (last === null) {
+    if (first.last === null) {
       throw new GitHubApiError(0, 'its reviews list named a next page but no last page, so it could not be read from the newest back', 'listReviewsSince');
     }
+    // Response-supplied page numbers must permit finite, exact decrements;
+    // Infinity (or a number above the safe integer range) would never move.
+    // Do not cap at the read budget: a long history may have few new reviews.
+    const last = Math.max(1, Math.min(first.last, Number.MAX_SAFE_INTEGER));
     let rows: ApiReview[] = [];
     let page = last;
     while (page > 1) {
       const batch = (await read(page)).rows;
-      // Past the cap, a page counts only if it holds a new review too, as page 1 does below.
-      if (last - page >= THREAD_MAX_PAGES && batch.some((row) => submitted(row) >= sinceMs)) throw new ReadCapError('listReviewsSince');
+      if (batch.length === 0) break;
+      const reachedOlder = batch.some((row) => submitted(row) < sinceMs);
+      // An older-only boundary page may end the read; new rows beyond the
+      // cap may not. Unparseable timestamps cannot buy an unbounded walk.
+      if (last - page >= THREAD_MAX_PAGES &&
+          (batch.some((row) => submitted(row) >= sinceMs) || !reachedOlder)) throw new ReadCapError('listReviewsSince');
       rows = [...batch, ...rows];
-      if (batch.some((row) => submitted(row) < sinceMs)) break;
+      if (reachedOlder) break;
       page -= 1;
     }
     if (page === 1) {

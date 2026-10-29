@@ -2805,3 +2805,38 @@ test('token authorization is not forwarded by fetch to a different redirect orig
   assert.equal(sink.for('GET /redirected').length, 1);
   assert.equal(sink.for('GET /redirected')[0].headers.authorization, undefined);
 });
+
+
+for (const last of ['100000', '9'.repeat(400)]) {
+  test(`bounded review paging: an empty last page stops the read (${last.length > 10 ? 'overflow' : last})`, async () => {
+    const r = await tokenRig((fake) => {
+      fake.on('GET /repos/anima-research/rayforce/pulls/12/reviews', (req, nth): Answer => {
+        // Abort the unfixed implementation in the fixture, not after thousands
+        // of requests. A passing read never reaches this synthetic failure.
+        if (nth > 3) return { status: 422, body: { message: 'synthetic request budget exceeded' } };
+        return { body: [], headers: Number(req.query.page) === 1 ? { link: `<https://api.github.com/reviews?page=${last}>; rel="last"` } : {} };
+      });
+    });
+    assert.deepEqual(await r.adapter.listReviewsSince(PULL, '2026-10-14T00:00:00Z'), []);
+    assert.deepEqual(r.fake.for('GET /repos/anima-research/rayforce/pulls/12/reviews').map((call) => call.query.page), ['1', String(Math.min(Number(last), Number.MAX_SAFE_INTEGER))]);
+  });
+}
+
+test('bounded review paging: a zero last page clamps to page one, preserving its reviews', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /repos/anima-research/rayforce/pulls/12/reviews', { body: reviewRows(1, '2026-10-15T00:00:00Z', 1), headers: { link: '<https://api.github.com/reviews?page=0>; rel="last"' } });
+  });
+  assert.equal((await r.adapter.listReviewsSince(PULL, '2026-10-14T00:00:00Z')).length, 1);
+  assert.equal(r.fake.for('GET /repos/anima-research/rayforce/pulls/12/reviews').length, 1);
+});
+
+test('bounded review paging: invalid timestamps cannot bypass the descending page budget', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /repos/anima-research/rayforce/pulls/12/reviews', (_req, nth): Answer => {
+      if (nth > 24) return { status: 422, body: { message: 'synthetic request budget exceeded' } };
+      return { body: [{ id: nth, submitted_at: 'not-an-instant', state: 'COMMENTED' }], headers: { link: '<https://api.github.com/reviews?page=100000>; rel="last"' } };
+    });
+  });
+  await assert.rejects(() => r.adapter.listReviewsSince(PULL, '2026-10-14T00:00:00Z'), ReadCapError);
+  assert.equal(r.fake.for('GET /repos/anima-research/rayforce/pulls/12/reviews').length, 22, 'page one plus twenty pages and one boundary probe');
+});
