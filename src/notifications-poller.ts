@@ -902,6 +902,8 @@ export class NotificationsPoller {
       try {
         await this.deliver(event);
       } catch (err) {
+        // Unlike notification-thread retries, persistently refused checks stay
+        // on the existing head/TTL schedule, with no retry limit or drop notice.
         this.logger.warn('notifications: a checks event was refused; it is delivered when its pull request\'s turn comes again', {
           key,
           error: err instanceof Error ? err.message : String(err),
