@@ -983,9 +983,16 @@ export interface NotificationsWatermark {
  * A notified thread whose last read or delivery failed, or that GitHub's rate
  * limit kept from being read: the notifications poller reads it again on each
  * pass whose listing gets through, listed or not, until it gets through or has
- * failed {@link NOTIFICATION_RETRY_LIMIT} passes in a row.
+ * failed {@link NOTIFICATION_RETRY_LIMIT} passes in a row. A stopped entry
+ * retains that count and cursor until a newer notification reopens it.
  */
 export interface NotificationRetry {
+  /** Latest notification update seen; a strictly newer update reopens a stopped entry. */
+  updatedAt?: string;
+  /** Terminal retry record, retained so re-listing the same update cannot reset attempts. */
+  stopped?: boolean;
+  /** The drop notice for this notification update was attempted, even if the host refused it. */
+  dropAnnounced?: boolean;
   owner: string;
   name: string;
   number: number;

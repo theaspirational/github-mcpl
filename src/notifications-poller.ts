@@ -16,7 +16,8 @@
  * nothing read. Threads in a repository outside GITHUB_REPOS are dropped: no
  * tool and no `channels/publish` would act there, and a user's other threads
  * would only reach the agent's context for nothing. W moves on after a
- * complete listing whose event deliveries succeeded; a capped listing keeps
+ * complete listing; failed deliveries keep their thread's retry cursor, not W.
+ * A capped listing keeps
  * the original window and is read unconditionally again.
  *
  * **What it reads of a thread.** Each listed thread, and each thread a past
@@ -68,16 +69,18 @@
  *     keys it, so a row a pass reads twice is delivered once.
  *
  * **Failures.** Delivered means handed to `onEvent`, the server's event
- * pipeline. An explicit false receipt (including no eligible host), like a
- * thrown failure, leaves the event unrecorded for another pass. A thread's cursor
+ * pipeline. Passes pause without API or state changes while no MCPL host has
+ * a granted egress. An explicit false receipt during a pass, like a thrown
+ * failure, leaves the event unrecorded for another pass. A thread's cursor
  * moves past rows only once each was delivered, and past a state change only
  * once it was. A thread whose read failed, or one of whose events `onEvent`
  * threw on, goes on the retry list, which keeps its cursor too, and is
  * read again first on each later pass whose listing gets through, listed or
  * not, until it gets through or has failed {@link NOTIFICATION_RETRY_LIMIT}
  * passes in a row. Then it's dropped, with one `thread.read_failed` event on
- * its channel saying why, and read again when it next moves, from its cursor
- * while that is among the last 200 the head memory keeps. A thread gone or
+ * its channel saying why. A terminal retry entry retains the count and cursor
+ * so the same notification cannot restart the cycle; a newer update reopens it.
+ * A drop notice is attempted once per notification update, even if refused. A thread gone or
  * out of the token's reach is dropped at once. GitHub's rate limit counts no
  * pass against a thread: it ends the pass's reads, the threads not yet read
  * wait on the retry list for the next pass, and the thread that met it goes
@@ -159,6 +162,8 @@ export interface NotificationsPollerOptions {
   /** The token's login: whose open pull requests have their checks looked up. Without it, none are. */
   login?: string;
   onEvent: EventListener;
+  /** Production uses the server's live host/grant predicate; standalone listeners default to ready. */
+  canPoll?: () => boolean;
   logger?: Logger;
   /** Overridable in tests. */
   now?: () => Date;
@@ -306,7 +311,10 @@ const retryEntry = (
   attempts: number,
   cursor: string | null,
   reviewRequest?: { id: string; updatedAt: string },
+  previous?: NotificationRetry,
 ): NotificationRetry => ({
+  ...(previous?.updatedAt === undefined ? {} : { updatedAt: previous.updatedAt }),
+  ...(previous?.dropAnnounced ? { dropAnnounced: true } : {}),
   owner: thread.repo.owner,
   name: thread.repo.name,
   number: thread.number,
@@ -366,6 +374,8 @@ export class NotificationsPoller {
   private readonly repos: readonly RepoRef[];
   private readonly login: string;
   private readonly onEvent: EventListener;
+  private readonly canPoll: () => boolean;
+  private lastReady: boolean | undefined;
   private readonly logger: Logger;
   private readonly now: () => Date;
   /**
@@ -389,6 +399,7 @@ export class NotificationsPoller {
     this.repos = opts.repos;
     this.login = opts.login ?? '';
     this.onEvent = opts.onEvent;
+    this.canPoll = opts.canPoll ?? (() => true);
     this.logger = opts.logger ?? silentLogger();
     this.now = opts.now ?? (() => new Date());
   }
@@ -425,9 +436,9 @@ export class NotificationsPoller {
   start(): void {
     if (!this.enabled || this.running) return;
     this.running = true;
-    // The first pass runs an interval from now; a first start's W is taken
-    // now, so that pass lists from an interval before the start.
-    this.watermark();
+    // No state initialization while there is no eligible host. A fresh W is
+    // taken once ready, while an existing W survives any disconnected period.
+    if (this.ready()) this.watermark();
     this.schedule();
   }
 
@@ -477,11 +488,26 @@ export class NotificationsPoller {
     return { since, lastModified: null, answeredAt: null };
   }
 
+  private ready(): boolean {
+    const ready = this.canPoll();
+    if (ready !== this.lastReady) {
+      this.logger.debug(ready
+        ? 'notifications: polling resumed; a host has granted event egress'
+        : 'notifications: polling paused; no connected MCPL host has granted event egress');
+      this.lastReady = ready;
+    }
+    return ready;
+  }
+
   /**
    * One pass: list the threads GitHub updated since W and read each, with
    * every thread a past pass failed on; deliver what's new; move W on.
    */
   async pollOnce(): Promise<NotificationsPollResult> {
+    if (!this.ready()) return {
+      notModified: false, threads: 0, outOfScope: 0, delivered: [], duplicates: 0,
+      failed: 0, dropped: 0, truncated: false, checkLookups: 0,
+    };
     const receivedAt = this.now().toISOString();
     const { since, lastModified, answeredAt } = this.watermark();
     // A new thread listed now wasn't in GitHub's previous answer, so what's
@@ -527,40 +553,58 @@ export class NotificationsPoller {
     // reason supersedes a request still waiting: it says the same thing.
     const requests = new Map<string, { id: string; updatedAt: string }>();
     for (const [channel, retry] of retries) {
+      if (retry.stopped) continue;
       toRead.set(channel, retryThread(retry));
       if (retry.reviewRequest) requests.set(channel, retry.reviewRequest);
     }
+    const listed = new Map<string, NotificationRetry>();
     for (const n of page.notifications) {
       const thread: ThreadRef = { repo: n.repo, number: n.number, kind: n.kind };
       if (!repoAllowed(n.repo, this.repos)) {
         result.outOfScope += 1;
         continue;
       }
-      if (!toRead.has(channelId(thread))) toRead.set(channelId(thread), thread);
-      if (n.reason === 'review_requested' && n.kind === 'pull') requests.set(channelId(thread), { id: n.id, updatedAt: n.updatedAt });
+      const channel = channelId(thread);
+      const waiting = retries.get(channel);
+      const newer = waiting?.updatedAt === undefined || ms(n.updatedAt) > ms(waiting.updatedAt);
+      if (waiting?.stopped && !newer) continue;
+      if (!waiting || newer) {
+        // Keep a failed read's place even when a newer notification revives it.
+        // An active retry's consecutive failure count does not reset on updates.
+        listed.set(channel, {
+          ...retryEntry(thread, waiting?.stopped ? 0 : (waiting?.attempts ?? 0),
+            waiting?.cursor ?? this.state.polledHead(`notif:${channel}`), waiting?.reviewRequest),
+          updatedAt: n.updatedAt,
+        });
+      }
+      if (!toRead.has(channel)) toRead.set(channel, thread);
+      if (n.reason === 'review_requested' && n.kind === 'pull') requests.set(channel, { id: n.id, updatedAt: n.updatedAt });
     }
     result.threads = toRead.size;
 
     // The dedup ring as it stands, copied once a pass; each delivery adds its key.
     const alreadySeen = new Set(this.state.snapshot().pollKeys);
     let rateLimited = 0;
-    let deliveryFailed = false;
     for (const [channel, thread] of toRead) {
-      const waiting = retries.get(channel);
+      const waiting = listed.get(channel) ?? retries.get(channel);
       const attemptsSoFar = waiting?.attempts ?? 0;
       const request = requests.get(channel);
       if (rateLimited > 0) {
         // GitHub's rate limit ended this pass's reads: the rest wait for the next, uncounted.
-        retries.set(channel, retryEntry(thread, attemptsSoFar, this.holdPlace(thread, reachFrom, waiting?.cursor ?? null), request));
+        retries.set(channel, retryEntry(thread, attemptsSoFar, this.holdPlace(thread, reachFrom, waiting?.cursor ?? null), request, waiting));
         rateLimited += 1;
         continue;
       }
       const outcome = await this.pollThread(thread, reachFrom, receivedAt, alreadySeen, waiting?.cursor ?? null, request);
-      deliveryFailed ||= outcome.deliveryFailed === true;
       result.delivered.push(...outcome.delivered);
       result.duplicates += outcome.duplicates;
       if (outcome.failure === null) {
-        retries.delete(channel);
+        if (waiting?.dropAnnounced) {
+          // A review request can finish after its backlog notice. Keep the
+          // notice's terminal record so re-listing that update cannot repeat it.
+          retries.set(channel, { ...retryEntry(thread, attemptsSoFar,
+            this.state.polledHead(`notif:${channel}`), undefined, waiting), stopped: true });
+        } else retries.delete(channel);
       } else {
         result.failed += 1;
         const place = this.state.polledHead(`notif:${channel}`);
@@ -568,21 +612,26 @@ export class NotificationsPoller {
           rateLimited = 1;
           // To the back of the list, so the thread that met the limit can't keep the rest waiting.
           retries.delete(channel);
-          retries.set(channel, retryEntry(thread, attemptsSoFar, place, outcome.request));
+          retries.set(channel, retryEntry(thread, attemptsSoFar, place, outcome.request, waiting));
         } else {
           const attempts = attemptsSoFar + 1;
+          const retry = retryEntry(thread, attempts, place, outcome.request, waiting);
           if (outcome.failure.kind !== 'failed' || attempts >= NOTIFICATION_RETRY_LIMIT) {
-            retries.delete(channel);
             result.dropped += 1;
-            result.delivered.push(...(await this.announceDrop(thread, outcome.failure, attempts, receivedAt)));
-            // A skipped backlog leaves the thread readable from its current
-            // update, so a review request refused beside it is read again with it.
-            if (outcome.failure.kind === 'backlog' && outcome.request && attempts < NOTIFICATION_RETRY_LIMIT) {
-              retries.set(channel, retryEntry(thread, attempts, place, outcome.request));
+            // A skipped backlog can still owe a review-request handoff, but
+            // it shares the same five-pass budget and one notice.
+            retry.stopped = !(outcome.failure.kind === 'backlog' && outcome.request && attempts < NOTIFICATION_RETRY_LIMIT);
+            if (!retry.dropAnnounced) {
+              // Persist before the notice: a crash or refusal must not make
+              // this same notification produce another drop announcement.
+              retry.dropAnnounced = true;
+              retries.set(channel, retry);
+              this.state.setNotificationRetries([...retries.values()]);
+              await this.state.flush();
+              result.delivered.push(...(await this.announceDrop(thread, outcome.failure, attempts, receivedAt)));
             }
-          } else {
-            retries.set(channel, retryEntry(thread, attempts, place, outcome.request));
           }
+          retries.set(channel, retry);
         }
       }
       this.state.setNotificationRetries([...retries.values()]);
@@ -596,7 +645,6 @@ export class NotificationsPoller {
       });
     } else {
       const checks = await this.pollOwnChecks(receivedAt, alreadySeen);
-      deliveryFailed ||= checks.deliveryFailed;
       result.delivered.push(...checks.delivered);
       result.duplicates += checks.duplicates;
       result.checkLookups = checks.lookups;
@@ -606,6 +654,8 @@ export class NotificationsPoller {
     // Keep the entire window rather than assuming an ascending listing order.
     // A persistently full 1,000-thread window may repeat without reaching its
     // tail; log every truncated pass rather than claiming complete catch-up.
+    // Repeating up to 20 unconditional listing pages plus thread reads can
+    // exhaust the shared token's rate limit and degrade tool calls too.
     const next = page.notModified || page.truncated ? since : nextWatermark(page, since);
     if (page.truncated) {
       this.logger.error('notifications: the listing stopped at its page cap; retaining the window for an unconditional retry', {
@@ -616,13 +666,12 @@ export class NotificationsPoller {
     }
     // W moves only on what a listing showed; a 304 leaves it, and records when GitHub answered.
     const answered = ms(page.date);
-    // A failed handoff is not progress, even though the inbox listing worked.
-    // Preserve the reach-back anchor as well as W while the retry is pending.
-    // A conditional 304 cannot complete a truncated listing. Its reach-back
-    // anchor must also stand, so an older omitted thread can still be read.
-    this.state.setNotificationsWatermark(deliveryFailed || page.truncated ? {
+    // A failed handoff keeps its thread cursor in the retry entry, not the
+    // global window or conditional header. Only truncation holds this window:
+    // a 304 cannot complete an omitted tail or move its reach-back anchor.
+    this.state.setNotificationsWatermark(page.truncated ? {
       since,
-      lastModified: page.truncated ? null : lastModified,
+      lastModified: null,
       answeredAt,
     } : {
       since: next,
@@ -650,7 +699,6 @@ export class NotificationsPoller {
   ): Promise<{
     delivered: NormalizedEvent[];
     duplicates: number;
-    deliveryFailed?: boolean;
     failure: ThreadFailure | null;
     /** The review request still to deliver, when it wasn't. */
     request?: { id: string; updatedAt: string };
@@ -755,7 +803,6 @@ export class NotificationsPoller {
     return {
       delivered,
       duplicates,
-      deliveryFailed: !through,
       failure: failure === null ? null : { kind: 'failed', cause: `the host refused one of its events (${failure})` },
       ...(request && requestRefused !== null ? { request } : {}),
     };
@@ -782,8 +829,8 @@ export class NotificationsPoller {
   private async pollOwnChecks(
     receivedAt: string,
     alreadySeen: Set<string>,
-  ): Promise<{ delivered: NormalizedEvent[]; duplicates: number; lookups: number; deliveryFailed: boolean }> {
-    const out = { delivered: [] as NormalizedEvent[], duplicates: 0, lookups: 0, deliveryFailed: false };
+  ): Promise<{ delivered: NormalizedEvent[]; duplicates: number; lookups: number }> {
+    const out = { delivered: [] as NormalizedEvent[], duplicates: 0, lookups: 0 };
     if (!this.login) return out;
     let pulls: OwnPull[];
     try {
@@ -855,7 +902,6 @@ export class NotificationsPoller {
       try {
         await this.deliver(event);
       } catch (err) {
-        out.deliveryFailed = true;
         this.logger.warn('notifications: a checks event was refused; it is delivered when its pull request\'s turn comes again', {
           key,
           error: err instanceof Error ? err.message : String(err),
@@ -939,7 +985,7 @@ export class NotificationsPoller {
 
   /** Void listeners keep their legacy accepted-handoff contract; false is not success. */
   private async deliver(event: NormalizedEvent): Promise<void> {
-    if (await this.onEvent(event) === false) throw new Error('no host egress accepted the complete event');
+    if (await this.onEvent(event) === false) throw new Error('no host egress accepted the event');
   }
 
   /**

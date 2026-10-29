@@ -123,6 +123,7 @@ async function build(config: Config, log: Logger): Promise<{ server: GitHubMcplS
       repos: config.repos,
       login: config.botLogin,
       onEvent: server.onEvent,
+      canPoll: server.canReceiveEvents,
       logger: log,
     });
     notifications.start();

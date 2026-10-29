@@ -445,6 +445,9 @@ test('a notifications watermark that does not read as an instant is dropped on l
         retry: [
           { owner: 'o', name: 'n', number: 1, kind: 'issue', attempts: 2 },
           { bogus: true },
+          { owner: 'o', name: 'n', number: 10, kind: 'issue', attempts: 5, updatedAt: 'bad-date' },
+          { owner: 'o', name: 'n', number: 11, kind: 'issue', attempts: 5, stopped: 'yes' },
+          { owner: 'o', name: 'n', number: 12, kind: 'issue', attempts: 5, dropAnnounced: 'yes' },
           { owner: 'o', name: 'n', number: 0, kind: 'issue', attempts: 0 },
           { owner: '', name: 'n', number: 2, kind: 'issue', attempts: 0 },
           { owner: 'o', name: '', number: 4, kind: 'issue', attempts: 0 },

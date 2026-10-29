@@ -635,7 +635,7 @@ test('a thread that fails five passes in a row is dropped with one event on its 
     r.github.lastModified = `Wed, 15 Oct 2026 00:1${pass}:00 GMT`;
     await r.poller.pollOnce();
   }
-  assert.deepEqual(r.state.notificationRetries(), []);
+  assert.deepEqual(r.state.notificationRetries().filter((retry) => !retry.stopped), []);
   assert.equal(r.events.length, 1);
   const notice = r.events[0];
   assert.equal(notice.kind, 'thread.read_failed');
@@ -664,7 +664,7 @@ test('a thread gone or out of reach is dropped at once, with its event, and W mo
   r.github.failing.set(channelId(ISSUE), new GitHubApiError(404, 'Not Found', 'getPolledThread'));
   const result = await r.poller.pollOnce();
   assert.equal(result.dropped, 1);
-  assert.deepEqual(r.state.notificationRetries(), []);
+  assert.deepEqual(r.state.notificationRetries().filter((retry) => !retry.stopped), []);
   assert.deepEqual(r.events.map((e) => e.kind), ['thread.read_failed']);
   assert.match(r.events[0].body ?? '', /GitHub answered 404: Not Found, so the thread is gone or out of this token's reach/);
   assert.doesNotMatch(r.events[0].body ?? '', /passes|in a row/);
@@ -797,7 +797,7 @@ test('a thread with more new activity than one read takes is read from its curre
   };
   const first = await r.poller.pollOnce();
   assert.equal(first.dropped, 1);
-  assert.deepEqual(r.state.notificationRetries(), [], 'not read again five times: the same read would meet the same cap');
+  assert.deepEqual(r.state.notificationRetries().filter((retry) => !retry.stopped), [], 'not read again five times: the same read would meet the same cap');
   assert.equal(r.events.length, 1);
   assert.equal(r.events[0].kind, 'thread.read_failed');
   assert.match(r.events[0].body ?? '', /skipped this thread's backlog: it had more than 2,000 comments or reviews to read at once/);
@@ -1079,7 +1079,8 @@ test('a review request refused beside a skipped backlog waits on a retry entry, 
   assert.equal(second.notModified, true);
   assert.deepEqual(restarted.events.map((e) => e.id), ['poll:review_requested:n-rayforce-12:2026-10-15T00:09:30Z']);
   assert.ok(r.github.calls.includes(`reviews ${channelId(PULL)} since=2026-10-15T00:09:29Z`), 'read from its current update on, as the skip left it');
-  assert.deepEqual(restarted.state.notificationRetries(), []);
+  assert.deepEqual(restarted.state.notificationRetries().filter((retry) => !retry.stopped), []);
+  assert.equal(restarted.state.notificationRetries()[0].dropAnnounced, true);
 });
 
 test('a review request refused beside a backlog skipped on every pass is dropped after five passes, as any thread is', async () => {
@@ -1095,7 +1096,9 @@ test('a review request refused beside a backlog skipped on every pass is dropped
     await r.poller.pollOnce();
     attempts.push(...r.state.notificationRetries().map((x) => x.attempts));
   }
-  assert.deepEqual(attempts, [1, 2, 3, 4], 'counted on each pass, and gone after the fifth');
+  assert.deepEqual(attempts, [1, 2, 3, 4, 5], 'terminal count is retained after the fifth');
+  assert.equal(r.state.notificationRetries()[0].stopped, true);
+  assert.equal(r.events.filter((event) => event.kind === 'thread.read_failed').length, 1);
 });
 
 test('a review request listed beside a thread read that meets GitHub\'s rate limit waits on its retry entry, and arrives next pass', async () => {
@@ -1377,7 +1380,7 @@ test('a pass whose thread reads met GitHub\'s rate limit looks up no checks', as
 
 
 for (const unavailable of ['disconnected', 'plain-mcp', 'ungranted', 'channel-error', 'channel-refused', 'push-refused'] as const) {
-  test(`delivery receipt: ${unavailable} retains notification progress until a host accepts`, async (t) => {
+  test(`delivery receipt: ${unavailable} retains thread progress until a host accepts`, async (t) => {
     const r = rig();
     r.github.threads.set(channelId(ISSUE), threadRow(ISSUE));
     r.github.comments.set(channelId(ISSUE), [comment(1, 7, '2026-10-15T00:09:30Z')]);
@@ -1411,15 +1414,16 @@ for (const unavailable of ['disconnected', 'plain-mcp', 'ungranted', 'channel-er
         });
       }
     }
-    const poller = new NotificationsPoller({ api: r.github, state: r.state, intervalMs: 60000, repos: [REPO], onEvent: (event) => server.onEvent(event), now: () => new Date(START) });
+    const poller = new NotificationsPoller({ api: r.github, state: r.state, intervalMs: 60000, repos: [REPO], onEvent: (event) => server.onEvent(event), canPoll: () => server.canReceiveEvents(), now: () => new Date(START) });
     const first = await poller.pollOnce();
     assert.equal(first.delivered.length, 0);
-    assert.equal(first.failed, 1);
+    const paused = ['disconnected', 'plain-mcp', 'ungranted'].includes(unavailable);
+    assert.equal(first.failed, paused ? 0 : 1);
     assert.deepEqual(r.state.snapshot().pollKeys, []);
     assert.equal(r.state.polledHead(`notif:${channelId(ISSUE)}`), cursor);
-    assert.equal(r.state.notificationsWatermark().since, FIRST_W);
-    assert.equal(r.state.notificationsWatermark().answeredAt, null);
-    assert.equal(r.state.notificationRetries().length, 1);
+    assert.equal(r.state.notificationsWatermark().since, paused ? FIRST_W : '2026-10-15T00:09:39Z');
+    assert.equal(r.state.notificationsWatermark().answeredAt, paused ? null : '2026-10-15T00:10:00Z');
+    assert.equal(r.state.notificationRetries().length, paused ? 0 : 1);
 
     const ready = harness({ api });
     t.after(() => ready.close());
@@ -1526,3 +1530,131 @@ for (const accepted of ['channel', 'push'] as const) {
     assert.ok(warnings.some((message) => message.includes('declined')));
   });
 }
+
+for (const unavailable of ['disconnected', 'plain-mcp', 'ungranted'] as const) {
+  test(`host readiness: ${unavailable} skips twelve passes, resumes once, and pauses on disconnect`, async (t) => {
+    const r = rig();
+    r.github.threads.set(channelId(ISSUE), threadRow(ISSUE));
+    r.github.comments.set(channelId(ISSUE), [comment(1, 7, '2026-10-15T00:09:30Z')]);
+    r.github.notify(ISSUE, '2026-10-15T00:09:30Z');
+    const api = new FakeGitHubApi();
+    api.seedIssue({ number: 7 });
+    const h = harness({ api });
+    t.after(() => h.close());
+    let server = unavailable === 'disconnected' ? new GitHubMcplServer(api) : h.server;
+    if (unavailable !== 'disconnected') await initialize(h, unavailable !== 'plain-mcp');
+    const transitions: string[] = [];
+    const record = (message: string) => { transitions.push(message); };
+    const poller = new NotificationsPoller({ api: r.github, state: r.state, intervalMs: 60000, repos: [REPO],
+      onEvent: (event) => server.onEvent(event), canPoll: () => server.canReceiveEvents(), now: () => new Date(START),
+      logger: { debug: record, info: record, warn() {}, error() {} } });
+    const before = r.state.snapshot();
+    poller.start();
+    poller.stop();
+    for (let pass = 0; pass < 12; pass++) await poller.pollOnce();
+    assert.deepEqual(r.github.calls, [], 'no inbox, thread, or check reads while no host is eligible');
+    assert.deepEqual(r.state.snapshot(), before, 'not even initial watermark/retry state changes');
+    assert.equal(transitions.filter((s) => s.includes('paused')).length, 1);
+
+    const ready = harness({ api });
+    await initialize(ready, true);
+    await grant(ready);
+    server = ready.server;
+    assert.equal((await poller.pollOnce()).delivered.length, 1);
+    assert.equal((await poller.pollOnce()).delivered.length, 0);
+    assert.equal(ready.hostSaw.filter((req) => req.method === method.CHANNELS_INCOMING).length, 1);
+    assert.equal(transitions.filter((s) => s.includes('resumed')).length, 1);
+    await ready.close();
+    const calls = r.github.calls.length;
+    const after = r.state.snapshot();
+    for (let pass = 0; pass < 12; pass++) await poller.pollOnce();
+    assert.equal(r.github.calls.length, calls);
+    assert.deepEqual(r.state.snapshot(), after);
+    assert.equal(transitions.filter((s) => s.includes('paused')).length, 2);
+  });
+}
+
+for (const egress of ['channel', 'push'] as const) for (const acceptDrop of [true, false]) {
+  test(`bounded refusal: ${egress} stops after five attempts and announces one drop across twelve passes and restart (drop accepted: ${acceptDrop})`, async (t) => {
+    const file = join(mkdtempSync(join(tmpdir(), 'gh-notif-bounded-')), 'state.json');
+    const r = rig({ stateFile: file });
+    r.github.threads.set(channelId(ISSUE), threadRow(ISSUE));
+    r.github.comments.set(channelId(ISSUE), [comment(1, 7, '2026-10-15T00:09:30Z')]);
+    r.github.notify(ISSUE, '2026-10-15T00:09:30Z');
+    // Keep re-listing exactly the same notification, including after restart.
+    r.github.conditional = false;
+    r.github.lastModified = 'Wed, 15 Oct 2026 00:09:30 GMT';
+    const api = new FakeGitHubApi();
+    api.seedIssue({ number: 7 });
+    const h = harness({ api });
+    t.after(() => h.close());
+    await initialize(h, true);
+    await grant(h, egress === 'push' ? ['pushEvents'] : ['channels.register', 'channels.incoming']);
+    let attempts = 0;
+    let drops = 0;
+    let recover = false;
+    h.host.removeAllListeners('request');
+    h.host.on('request', (req) => {
+      if (req.method === method.CHANNELS_REGISTER || req.method === method.CHANNELS_CHANGED) {
+        const p = req.params as { channels?: { id: string }[]; updated?: { id: string }[] };
+        h.host.sendResponse(req.id, { results: (p.channels ?? p.updated ?? []).map((c) => ({ id: c.id, accepted: true })) });
+        return;
+      }
+      const p = req.params as { eventId?: string; messages?: { messageId: string }[] };
+      const id = p.eventId ?? p.messages![0].messageId;
+      const drop = id.startsWith('poll:read_failed:');
+      if (drop) drops += 1; else attempts += 1;
+      const accepted = drop ? acceptDrop : recover;
+      h.host.sendResponse(req.id, p.messages ? { results: p.messages.map((m) => ({ messageId: m.messageId, accepted })) } : { accepted });
+    });
+    let state = r.state;
+    const create = () => new NotificationsPoller({ api: r.github, state, intervalMs: 60000, repos: [REPO],
+      onEvent: h.server.onEvent, canPoll: h.server.canReceiveEvents, now: () => new Date(START) });
+    let poller = create();
+    for (let pass = 1; pass <= 12; pass++) {
+      await poller.pollOnce();
+      if (pass === 3 || pass === 7) { state = GithubState.load(file); poller = create(); }
+    }
+    assert.equal(attempts, 5, 'same notification cannot reset its retry count after a drop');
+    assert.equal(drops, 1, 'one announcement for this thread/notification update, even across restart');
+    assert.equal(state.notificationRetries()[0]?.attempts, 5);
+    assert.equal(state.notificationRetries()[0]?.stopped, true);
+    assert.deepEqual(state.snapshot().pollKeys, [], 'a refused event is not falsely deduplicated');
+    assert.equal(state.notificationsWatermark().lastModified, r.github.lastModified, 'failed handoff does not force unconditional listings');
+    assert.equal(state.notificationsWatermark().since, '2026-10-15T00:09:29Z');
+    assert.equal(r.github.calls.filter((call) => call.startsWith('thread ')).length, 5);
+
+    recover = true;
+    r.github.notify(ISSUE, '2026-10-15T00:12:00Z');
+    r.github.threads.set(channelId(ISSUE), threadRow(ISSUE, { updatedAt: '2026-10-15T00:12:00Z' }));
+    r.github.lastModified = 'Wed, 15 Oct 2026 00:12:00 GMT';
+    assert.equal((await poller.pollOnce()).delivered.length, 1, 'a genuinely newer notification resumes from the held cursor');
+    assert.equal(drops, 1);
+    assert.deepEqual(state.notificationRetries(), []);
+  });
+}
+
+test('host readiness: revoking egress pauses an outstanding retry without consuming its budget', async (t) => {
+  const r = rig();
+  r.github.threads.set(channelId(ISSUE), threadRow(ISSUE));
+  r.github.comments.set(channelId(ISSUE), [comment(1, 7, '2026-10-15T00:09:30Z')]);
+  r.github.notify(ISSUE, '2026-10-15T00:09:30Z');
+  const api = new FakeGitHubApi();
+  api.seedIssue({ number: 7 });
+  const h = harness({ api, pushAccepted: false });
+  t.after(() => h.close());
+  await initialize(h, true);
+  await grant(h, ['pushEvents']);
+  const poller = new NotificationsPoller({ api: r.github, state: r.state, intervalMs: 60000, repos: [REPO],
+    canPoll: h.server.canReceiveEvents, onEvent: h.server.onEvent, now: () => new Date(START) });
+  assert.equal((await poller.pollOnce()).failed, 1);
+  const pending = r.state.snapshot();
+  const calls = r.github.calls.length;
+  await grant(h, []);
+  for (let pass = 0; pass < 12; pass++) await poller.pollOnce();
+  assert.deepEqual(r.state.snapshot(), pending);
+  assert.equal(r.github.calls.length, calls);
+  await grant(h, ['channels.register', 'channels.incoming']);
+  assert.equal((await poller.pollOnce()).delivered.length, 1);
+  assert.deepEqual(r.state.notificationRetries(), []);
+});

@@ -1285,6 +1285,13 @@ export class GitHubMcplServer {
    * as their `onEvent`, so one pipeline tags, renders and forwards whatever
    * arrived, however it arrived.
    */
+  /** Whether contributor polling has any currently connected, granted egress. */
+  readonly canReceiveEvents = (): boolean => {
+    const conn = this.conn;
+    return !!conn && !conn.isClosed &&
+      (this.eventEgressAllowed(conn, 'push') || this.eventEgressAllowed(conn, 'incoming'));
+  };
+
   readonly onEvent = (event: NormalizedEvent): Promise<boolean> => this.handleEvent(event);
 
   private async handleEvent(event: NormalizedEvent): Promise<boolean> {
