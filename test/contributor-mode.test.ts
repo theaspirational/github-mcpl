@@ -10,7 +10,7 @@
  */
 
 import { strict as assert } from 'node:assert';
-import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -242,4 +242,17 @@ test('a write still has to name one of the several owners GITHUB_REPOS allows in
   );
   assert.equal(outsideBoth.isError, true);
   assert.match(text(outsideBoth), /not in GITHUB_REPOS/);
+});
+
+
+test('token-file privacy checks the symlink target mode, not symlink provenance', () => {
+  const target = tmpFile('token', 'synthetic-token-only\n');
+  const link = join(mkdtempSync(join(tmpdir(), 'github-mcpl-token-link-')), 'link');
+  symlinkSync(target, link);
+  const env = { GITHUB_TOKEN_FILE: link, GITHUB_REPOS: 'anima-research/rayforce' };
+  assert.equal(readConfig(env).userToken, 'synthetic-token-only');
+  chmodSync(target, 0o640);
+  const problems = problemsOf(env);
+  assert.ok(problems.some((problem) => problem.includes('must be 600')));
+  assert.ok(problems.every((problem) => !problem.includes('synthetic-token-only')));
 });

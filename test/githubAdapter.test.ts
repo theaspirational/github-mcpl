@@ -2752,3 +2752,56 @@ test('a request that fails before GitHub answers is told apart from an answer', 
   assert.equal(err.answered, false);
   assert.match(describeFailure(err), /^the request to GitHub failed: /);
 });
+
+test('token-mode error diagnostics preserve answered independently of uncertain writes', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /repos/anima-research/rayforce/issues/7', { status: 502, body: { message: 'synthetic read failure' } });
+    fake.on('POST /repos/anima-research/rayforce/issues/7/comments', { status: 502, body: { message: 'synthetic write failure' } });
+  });
+  for (const [call, possiblyDone] of [
+    [() => r.adapter.getIssue(ISSUE), false],
+    [() => r.adapter.createComment(ISSUE, 'synthetic comment'), true],
+  ] as const) {
+    await assert.rejects(call, (error: unknown) => {
+      assert.ok(error instanceof GitHubApiError);
+      assert.equal(error.answered, true);
+      assert.equal(error.possiblyDone, possiblyDone);
+      assert.match(describeFailure(error), /^GitHub answered 502:/);
+      return true;
+    });
+  }
+  assert.equal(r.fake.for('POST /repos/anima-research/rayforce/issues/7/comments').length, 1, 'a possibly completed write is not repeated');
+  const noAnswer = new GitHubApiError(500, 'synthetic connection loss', 'createComment', true, false);
+  assert.equal(noAnswer.possiblyDone, true);
+  assert.match(describeFailure(noAnswer), /^the request to GitHub failed:/);
+});
+
+test('contributor pagination extracts page numbers but never fetches a response-supplied origin', async () => {
+  const r = await tokenRig((fake) => {
+    fake.on('GET /repos/anima-research/rayforce/pulls/12/reviews', (req): Answer => ({
+      body: [{ id: Number(req.query.page), submitted_at: '2026-10-15T00:00:00Z', state: 'COMMENTED', user: { login: 'reviewer' } }],
+      headers: Number(req.query.page) === 1 ? { link: '<https://untrusted.example.invalid/steal?page=2>; rel="last"' } : {},
+    }));
+  });
+  const rows = await r.adapter.listReviewsSince(PULL, '2026-10-14T00:00:00Z');
+  assert.equal(rows.length, 2);
+  assert.deepEqual(r.fake.calls.map((call) => call.path), [
+    '/repos/anima-research/rayforce/pulls/12/reviews',
+    '/repos/anima-research/rayforce/pulls/12/reviews',
+  ]);
+  assert.ok(r.fake.calls.every((call) => call.headers.authorization === `token ${USER_TOKEN}`));
+});
+
+test('token authorization is not forwarded by fetch to a different redirect origin', async () => {
+  const sink = new FakeGitHub();
+  sink.on('GET /redirected', { body: ISSUE_PAYLOAD });
+  await sink.start();
+  after(() => sink.stop());
+  const r = await tokenRig((fake) => {
+    fake.on('GET /repos/anima-research/rayforce/issues/7', { status: 302, headers: { location: `${sink.baseUrl}/redirected` } });
+  });
+  await r.adapter.getIssue(ISSUE);
+  assert.equal(r.fake.for('GET /repos/anima-research/rayforce/issues/7')[0].headers.authorization, `token ${USER_TOKEN}`);
+  assert.equal(sink.for('GET /redirected').length, 1);
+  assert.equal(sink.for('GET /redirected')[0].headers.authorization, undefined);
+});

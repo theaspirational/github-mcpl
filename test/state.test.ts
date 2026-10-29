@@ -503,3 +503,27 @@ test('a retry entry keeps its cursor across a restart', () => {
   );
   assert.deepEqual(GithubState.load(file).notificationRetries(), [{ owner: 'o', name: 'n', number: 1, kind: 'issue', attempts: 2, cursor }]);
 });
+
+test('App poll cursors and contributor notification state coexist across flush and reload', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'github-mcpl-state-')), 'state.json');
+  const state = GithubState.empty(file);
+  const since = '2026-10-15T00:09:00Z';
+  const resumeAt = '2026-10-15T00:10:00Z';
+  state.setLastPollAt(since);
+  state.setPollCursors({ 'o/n:issues': { since, resumeAt } });
+  state.setPolledNew({ 'o/n:issues': { '7': since } });
+  state.setNotificationsWatermark({ since: resumeAt, lastModified: 'Thu, 15 Oct 2026 00:10:00 GMT', answeredAt: resumeAt });
+  state.setNotificationRetries([{ owner: 'o', name: 'n', number: 7, kind: 'pull', attempts: 1, cursor: 'saved cursor', reviewRequest: { id: 'n7', updatedAt: resumeAt } }]);
+  state.setPolledHead('github:o/n#7', 'app-head');
+  state.setPolledHead('notif:github:o/n#7', 'notification-cursor');
+  await state.flush();
+  const loaded = GithubState.load(file);
+  assert.deepEqual(loaded.snapshot(), state.snapshot());
+  assert.deepEqual(loaded.pollCursors(), { 'o/n:issues': { since, resumeAt } });
+  assert.deepEqual(loaded.polledNew(), { 'o/n:issues': { '7': since } });
+  // Updating either mode does not replace the other's progress.
+  loaded.setNotificationsWatermark({ since: resumeAt, lastModified: null, answeredAt: resumeAt });
+  assert.equal(loaded.lastPollAt(), since);
+  loaded.setPollCursors({});
+  assert.equal(loaded.notificationRetries()[0].reviewRequest?.id, 'n7');
+});

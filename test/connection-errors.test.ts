@@ -103,3 +103,23 @@ test('a stream error ends serve() and is logged', { timeout: 5000 }, async () =>
     `the stream error is logged: ${JSON.stringify(h.logger.lines)}`,
   );
 });
+
+test('a clean host EOF ends serve without a connection error', { timeout: 5000 }, async () => {
+  const h = rawHost();
+  await h.initialize();
+  h.toServer.end();
+  await h.served;
+  assert.equal(h.logger.lines.some((line) => line.startsWith('error ')), false);
+});
+
+test('UTF-8 split inside a multibyte character remains one JSON-RPC request', { timeout: 5000 }, async (t) => {
+  const h = rawHost();
+  t.after(() => h.toServer.end());
+  await h.initialize();
+  const wire = Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'tools/list', params: { cursor: '雪🙂\u2028\u2029' } }) + '\n');
+  // Every byte separately exercises the transport decoder, not just JSON's handling of separators.
+  for (const byte of wire) h.toServer.write(Buffer.from([byte]));
+  const answer = await h.answerTo(4) as { result?: unknown };
+  assert.ok(answer.result);
+  assert.equal(h.logger.lines.some((line) => line.startsWith('error ')), false);
+});
