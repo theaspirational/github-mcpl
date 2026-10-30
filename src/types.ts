@@ -140,7 +140,16 @@ export type CheckConclusion =
   | 'timed_out'
   | 'action_required'
   | 'skipped'
-  | 'stale';
+  | 'stale'
+  | 'startup_failure';
+
+/** GITHUB_CHECKS_EMIT: preserve legacy output unless explicitly opted in. */
+export type ChecksEmit = 'all' | 'failures';
+
+/** Worst first, for the opt-in summary. Legacy summaries keep their old set. */
+export const CHECK_FAILURE_CONCLUSIONS: readonly CheckConclusion[] = [
+  'startup_failure', 'failure', 'timed_out', 'cancelled', 'action_required', 'stale',
+];
 
 /**
  * A webhook delivery or a polled row, normalized. `raw` is the original
@@ -1275,6 +1284,8 @@ export interface Config {
    * poller is always on in this mode.
    */
   pollIntervalMs: number;
+  /** GITHUB_CHECKS_EMIT; all preserves the legacy event stream. */
+  checksEmit: ChecksEmit;
   /**
    * GITHUB_REPOS, the write allow-list. In App mode several repositories are
    * accepted as long as they share one owner, which is one App installation
@@ -1318,6 +1329,7 @@ export const ENV_VARS = [
   'GITHUB_WEBHOOK_PORT',
   'GITHUB_WEBHOOK_PATH',
   'GITHUB_POLL_INTERVAL_MS',
+  'GITHUB_CHECKS_EMIT',
   'GITHUB_REPOS',
   'GITHUB_PR_BASE_ALLOW',
   'GITHUB_MERGE_BASE_ALLOW',
@@ -1578,6 +1590,12 @@ export function readConfig(env: Env = process.env, logger: Logger = stderrLogger
     }
   }
 
+  const rawChecksEmit = env.GITHUB_CHECKS_EMIT?.trim() ?? 'all';
+  if (rawChecksEmit !== 'all' && rawChecksEmit !== 'failures') {
+    problems.push('GITHUB_CHECKS_EMIT: must be all or failures');
+  }
+  const checksEmit = rawChecksEmit as ChecksEmit;
+
   const repos: RepoRef[] = [];
   const rawRepos = csv(env.GITHUB_REPOS);
   if (env.GITHUB_REPOS === undefined) {
@@ -1651,6 +1669,7 @@ export function readConfig(env: Env = process.env, logger: Logger = stderrLogger
     webhookPort,
     webhookPath,
     pollIntervalMs,
+    checksEmit,
     repos,
     prBaseAllow,
     mergeBaseAllow,

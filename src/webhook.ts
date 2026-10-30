@@ -21,6 +21,7 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import {
+  shouldEmitChecks,
   CheckGate,
   checkMarkOf,
   normalizeWebhook,
@@ -35,6 +36,7 @@ import {
   type Config,
   type GitHubApi,
   type Logger,
+  type ChecksEmit,
   type NormalizedEvent,
   type RepoRef,
 } from './types.js';
@@ -57,6 +59,8 @@ const EVENT_HEADER = 'x-github-event';
 export type EventListener = (event: NormalizedEvent) => void | boolean | Promise<void | boolean>;
 
 export interface WebhookListenerOptions {
+  /** GITHUB_CHECKS_EMIT; omitted preserves all legacy events. */
+  checksEmit?: ChecksEmit;
   /** GITHUB_WEBHOOK_SECRET_FILE's contents. Secret: never logged. */
   secret: string;
   /** GITHUB_WEBHOOK_PATH; defaults to {@link DEFAULT_WEBHOOK_PATH}. */
@@ -114,6 +118,7 @@ export class WebhookListener {
   private readonly path: string;
   private readonly repos: readonly RepoRef[];
   private readonly onEvent: EventListener;
+  private readonly checksEmit: ChecksEmit;
   private readonly api: Pick<GitHubApi, 'getCheckRuns'> | undefined;
   private readonly checkGate: CheckGate;
   private readonly logger: Logger;
@@ -124,6 +129,7 @@ export class WebhookListener {
   private server: Server | undefined;
 
   constructor(opts: WebhookListenerOptions) {
+    this.checksEmit = opts.checksEmit ?? 'all';
     this.secret = opts.secret;
     this.path = opts.path ?? DEFAULT_WEBHOOK_PATH;
     this.repos = opts.repos;
@@ -323,7 +329,7 @@ export class WebhookListener {
       receivedAt: raw.receivedAt,
     };
 
-    const events = normalizeWebhook(delivery);
+    const events = normalizeWebhook(delivery, this.checksEmit);
     if (events.length === 0) {
       this.logger.debug('webhook delivery carries no event this ingress maps', {
         delivery: raw.id,
@@ -360,7 +366,8 @@ export class WebhookListener {
       // sha — including a poll pass running right now — and drops it if what
       // the listener already accepted covers it.
       const delivered = await this.checkGate.emit(normalized.repo, normalized.sha as string, mark, async () => {
-        await this.onEvent(normalized);
+        // Suppression commits a mark too; a later stronger result can still pass.
+        if (shouldEmitChecks(normalized, this.checksEmit)) await this.onEvent(normalized);
       });
       if (!delivered) {
         this.logger.info('checks event dropped: this head sha already reported this result or a stronger one', {
@@ -399,6 +406,7 @@ export function webhookListenerFromConfig(
     secret: config.webhookSecret,
     path: config.webhookPath,
     repos: config.repos,
+    checksEmit: config.checksEmit,
     ...deps,
   });
 }

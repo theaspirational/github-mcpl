@@ -89,6 +89,7 @@
  */
 
 import {
+  shouldEmitChecks,
   isCompletedSummary,
   normalizeNotifiedReviewRequest,
   normalizePolledChecks,
@@ -108,6 +109,7 @@ import {
   type ChecksSummary,
   type EventActor,
   type Logger,
+  type ChecksEmit,
   type NormalizedEvent,
   type NotificationRetry,
   type NotificationsWatermark,
@@ -153,6 +155,8 @@ export interface NotificationsIngressState {
 }
 
 export interface NotificationsPollerOptions {
+  /** GITHUB_CHECKS_EMIT; omitted preserves all legacy events. */
+  checksEmit?: ChecksEmit;
   api: NotificationsPollerApi;
   state: NotificationsIngressState;
   /** GITHUB_POLL_INTERVAL_MS. readConfig refuses a value below the floor and defaults an unset one in contributor mode, so it is never 0 in practice. */
@@ -374,6 +378,7 @@ export class NotificationsPoller {
   private readonly repos: readonly RepoRef[];
   private readonly login: string;
   private readonly onEvent: EventListener;
+  private readonly checksEmit: ChecksEmit;
   private readonly canPoll: () => boolean;
   private lastReady: boolean | undefined;
   private readonly logger: Logger;
@@ -393,6 +398,7 @@ export class NotificationsPoller {
   private pass: Promise<unknown> = Promise.resolve();
 
   constructor(opts: NotificationsPollerOptions) {
+    this.checksEmit = opts.checksEmit ?? 'all';
     this.api = opts.api;
     this.state = opts.state;
     this.configuredIntervalMs = opts.intervalMs;
@@ -816,7 +822,8 @@ export class NotificationsPoller {
    * or that read is {@link HEAD_READ_TTL_MS} old. A head whose runs
    * have all finished is a `checks.completed` event as App mode's repository
    * poll makes it, keyed by its sha, conclusion and failed jobs, so each
-   * result is delivered once and a re-run that changes it is news. Once its
+   * result is handled once and a re-run that changes it is news. Suppression
+   * records the same durable key as delivery, without calling the listener. Once its
    * result is delivered with every run finished, or it has had no runs for
    * {@link NO_CHECKS_SETTLE_MS} since its head was read, a head isn't looked
    * up again until its pull request's `updated_at` moves or its head read is
@@ -899,8 +906,9 @@ export class NotificationsPoller {
         head.settled = settles;
         continue;
       }
+      const emit = shouldEmitChecks(event, this.checksEmit);
       try {
-        await this.deliver(event);
+        if (emit) await this.deliver(event);
       } catch (err) {
         // Unlike notification-thread retries, persistently refused checks stay
         // on the existing head/TTL schedule, with no retry limit or drop notice.
@@ -910,10 +918,11 @@ export class NotificationsPoller {
         });
         continue;
       }
+      // Suppression is a handled result too: persist its key and settle its head.
       this.state.seenPollKey(key);
       alreadySeen.add(key);
       head.settled = settles;
-      out.delivered.push(event);
+      if (emit) out.delivered.push(event);
     }
     this.checkTurn = start + tried;
     await this.state.flush();

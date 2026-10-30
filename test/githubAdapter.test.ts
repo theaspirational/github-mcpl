@@ -1,3 +1,4 @@
+import { checksCases, checkRuns } from './checks-cases.js';
 /**
  * GitHubAdapter against a local fake GitHub (TASK-SRHKG.1.2).
  *
@@ -3264,4 +3265,41 @@ test('contributor thread mutations surface GraphQL permission denials after memb
   }
   assert.equal(r.fake.for('POST /graphql').length, 4, 'one membership read and one mutation per tool');
   assertUserTransport(r);
+});
+
+for (const scenario of checksCases) {
+  test(`adapter checks policy: ${scenario.name}`, async () => {
+    const outputs: string[] = [];
+    for (const mode of [undefined, 'all', 'failures']) {
+      const r = await rig({ env: { GITHUB_CHECKS_EMIT: mode } });
+      r.fake.on(`GET /repos/anima-research/rayforce/commits/${HEAD_SHA}/check-runs`, {
+        body: { total_count: scenario.conclusions.length, check_runs: checkRuns(scenario.conclusions) },
+      });
+      const summary = await r.adapter.getCheckRuns(REPO, HEAD_SHA);
+      outputs.push(JSON.stringify(summary));
+      if (mode === 'failures') {
+        assert.equal(summary.conclusion !== 'success', scenario.emits);
+        assert.deepEqual(summary.failed.map((f) => f.name), scenario.conclusions.flatMap((c, i) =>
+          ['success', 'neutral', 'skipped'].includes(c) ? [] : [`job-${i}`]));
+      } else if (['stale', 'startup_failure'].includes(scenario.name)) {
+        assert.equal(summary.conclusion, 'success', 'preserve even legacy summary edge cases by default');
+        assert.deepEqual(summary.failed, []);
+      }
+    }
+    assert.equal(outputs[0], outputs[1]);
+  });
+}
+
+test('failure-only summary: pending and truncated green stay undecided; known failures still win', () => {
+  const options = { checksEmit: 'failures' as const };
+  const pending = { name: 'running', status: 'in_progress', conclusion: null };
+  assert.equal(summarizeChecks('s', [pending, ...checkRuns(['success'])], options).conclusion, null);
+  assert.equal(summarizeChecks('s', checkRuns(['success']), { ...options, truncated: true }).conclusion, null);
+  assert.equal(summarizeChecks('s', [], options).conclusion, null);
+  for (const c of ['stale', 'startup_failure', 'failure'] as const) {
+    const result = summarizeChecks('s', [pending, ...checkRuns([c])], options);
+    assert.equal(result.conclusion, c);
+    assert.equal(result.unfinished, true);
+  }
+  assert.equal(summarizeChecks('s', checkRuns(['failure', 'stale', 'startup_failure']), options).conclusion, 'startup_failure');
 });

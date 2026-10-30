@@ -1,3 +1,9 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { GithubState } from '../src/state.js';
+import { summarizeChecks } from '../src/github-adapter.js';
+import { checksCases, checkRuns } from './checks-cases.js';
 /**
  * Polling ingress (TASK-SRHKG.1.3, contract amendment 1).
  *
@@ -109,6 +115,7 @@ interface Rig {
 }
 
 interface RigOptions {
+  checksEmit?: 'all' | 'failures';
   cursor?: string | null;
   intervalMs?: number;
   api?: FakeGitHubApi;
@@ -153,6 +160,7 @@ function rig(opts: RigOptions = {}): Rig {
     maxHeadBacklog: opts.maxHeadBacklog,
     maxHeadAttempts: opts.maxHeadAttempts,
     checkGate: opts.checkGate,
+    checksEmit: opts.checksEmit,
     onEvent: (event) => {
       events.push(event);
       opts.onEvent?.(event);
@@ -1285,4 +1293,59 @@ test('a head whose event was accepted is not re-delivered by the durable gate ei
   const second = await r.poller.pollOnce();
   assert.equal(second.checkLookups, 0);
   assert.equal(second.delivered.length, 0);
+});
+
+for (const scenario of checksCases) {
+  test(`App poll checks filter: ${scenario.name}, with byte-identical default/all output`, async () => {
+    const outputs: string[] = [];
+    for (const checksEmit of [undefined, 'all', 'failures'] as const) {
+      const api = new FakeGitHubApi();
+      api.seedPullRequest({ number: 58, updatedAt: '2026-10-13T12:00:00.000Z' });
+      const r = rig({ api, checksEmit, getCheckRuns: async (_repo, sha) => summarizeChecks(sha, checkRuns(scenario.conclusions), { checksEmit }) });
+      const result = await r.poller.pollOnce();
+      const events = r.events.filter((e) => e.kind === 'checks.completed');
+      assert.equal(events.length, checksEmit !== 'failures' || scenario.emits ? 1 : 0);
+      assert.equal(result.checksBacklog, 0, 'suppression retires the head');
+      assert.equal(result.failed, 0);
+      assert.ok(r.state.snapshot().pollKeys.some((key) => key.startsWith('checks:')));
+      outputs.push(JSON.stringify(r.events));
+      assert.equal((await r.poller.pollOnce()).checkLookups, 0);
+    }
+    assert.equal(outputs[0], outputs[1]);
+  });
+}
+
+test('App poll suppression survives disk reload and a fresh gate, then permits a failing rerun', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'github-app-checks-filter-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const file = join(dir, 'state.json');
+  const state = GithubState.load(file);
+  state.setLastPollAt('2026-10-13T00:00:00Z');
+  const api = new FakeGitHubApi();
+  const pull = api.seedPullRequest({ number: 58, updatedAt: '2026-10-13T12:00:00.000Z' });
+  const events: NormalizedEvent[] = [];
+  let conclusion: 'success' | 'failure' = 'success';
+  let now = '2026-10-14T00:00:00Z';
+  const makePoller = (state: GithubState) => new Poller({
+    api: { listIssuesSince: (...args) => api.listIssuesSince(...args),
+      listIssueCommentsSince: (...args) => api.listIssueCommentsSince(...args),
+      listReviewCommentsSince: (...args) => api.listReviewCommentsSince(...args),
+      getCheckRuns: async (_repo, sha) => summarizeChecks(sha, checkRuns([conclusion])) },
+    state, repos: [TEST_REPO], intervalMs: MIN_POLL_INTERVAL_MS, checksEmit: 'failures',
+    now: () => new Date(now), onEvent: (event) => { events.push(event); },
+  });
+  await makePoller(state).pollOnce();
+  await state.flush();
+  const restored = GithubState.load(file);
+  assert.ok(restored.snapshot().pollKeys.some((key) => key.startsWith(`checks:${pull.head.sha}:success:`)));
+  now = '2026-10-14T02:00:00Z';
+  const restarted = makePoller(restored);
+  api.seedPullRequest({ number: 58, head: pull.head, updatedAt: '2026-10-14T01:00:00Z' });
+  assert.equal((await restarted.pollOnce()).duplicates, 1);
+  conclusion = 'failure';
+  api.seedPullRequest({ number: 58, head: pull.head, updatedAt: '2026-10-14T03:00:00Z' });
+  await restarted.pollOnce();
+  await restarted.pollOnce();
+  assert.deepEqual(events.filter((e) => e.kind === 'checks.completed').map((e) => e.checks?.conclusion), ['failure']);
+  await restored.flush();
 });

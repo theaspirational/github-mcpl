@@ -244,6 +244,7 @@ told where Node is instead of looking.
 | `GITHUB_WEBHOOK_PORT` | no | unset = listener off | TCP port of the webhook listener (bind it to loopback, terminate TLS in front). |
 | `GITHUB_WEBHOOK_PATH` | no | `/github/webhook` | Path the listener answers on. |
 | `GITHUB_POLL_INTERVAL_MS` | no | `0` (off) | Polling fallback: issues and PRs, issue comments and review comments updated since each list's cursor, plus the checks on the heads of the open PRs seen. `0` is off; a non-zero value below `60000` is refused. Partial — it cannot see a submitted review, a review request or a push ([what polling misses](docs/deploy.md#option-3--polling-only-no-webhook-at-all)) — and it is not meant to run alongside the webhook. |
+| `GITHUB_CHECKS_EMIT` | no | `all` | `all` preserves the existing checks event stream; `failures` suppresses green `checks.completed` events in every ingress path. Other values refuse startup. See [checks emission](#checks-emission). |
 | `GITHUB_REPOS` | yes | — | Comma-separated `owner/name` allow-list; a write anywhere else is refused by name. Several entries must share one owner (one App installation, one token); a second owner is a second server process. With several, every tool call names its repository. |
 | `GITHUB_PR_BASE_ALLOW` | no | empty = no PR target allowed | Branches a pull request may target or be retargeted to. A plain `branch` applies to every repository, `owner/name:branch` to that one: `anima-research/rayforce:dev,main`. |
 | `GITHUB_MERGE_BASE_ALLOW` | no | empty = no merge | Branches `merge_pull_request` may merge into, in the same format. Naming a branch here is what turns merging on; granting `github.merge` alone does not. |
@@ -320,6 +321,7 @@ For a resident that contributes to repositories it **cannot install the App on**
 | `GITHUB_BOT_LOGIN` | no | the token's login | The token owner's login, spelled as GitHub spells it (no `[bot]`). From-self and mention detection use it. Unset, the server takes it from `GET /user` at start, and stops when GitHub doesn't answer. Set, it is checked against the token's own login when GitHub answers, and the server stops if they differ; when GitHub doesn't answer, it starts unchecked and logs a warning. |
 | `GITHUB_REPOS` | yes | — | The repositories the agent works in, and the write allow-list. In this mode it may span several owners. Notifications from any other repository are dropped. Spell each as GitHub does: at start the server checks each against GitHub and stops on a different spelling, or a repository the token can't see. |
 | `GITHUB_POLL_INTERVAL_MS` | no | `60000` | Notifications poll interval; values below `60000` are refused. GitHub's `X-Poll-Interval` is honoured when it asks for longer. |
+| `GITHUB_CHECKS_EMIT` | no | `all` | `all` preserves the existing checks event stream; `failures` suppresses green `checks.completed` events in every ingress path. Other values refuse startup. See [checks emission](#checks-emission). |
 | `GITHUB_STATE_FILE` | recommended | — | Keeps the notifications watermark, when GitHub last answered, each thread's cursor, the threads to read again and the dedup ring across restarts. Without it, every start begins as a first start does (below): activity from a longer downtime isn't delivered, and some from before the start can arrive twice. |
 
 Setting both `GITHUB_TOKEN_FILE` and the App variables is a startup error, and so is `GITHUB_APP_INSTALLATION_ID`. `GITHUB_WEBHOOK_PORT` is refused in this mode: GitHub doesn't send webhooks for repositories you don't administer.
@@ -378,6 +380,48 @@ the re-run request. Runs outside those heads must also be polled with
 **Security.** A user token can do whatever its user can, wherever the user can. The tools' repository and merge/workflow allow-lists still apply, but they're the server's limits, not GitHub's. An `APPROVE` through `github.review` is the user's own approval, and counts toward branch protection wherever the user has write access; the shipped recipe doesn't enable that feature set.
 
 The recipe is App mode's contributor one, [`examples/recipe-contributor.json`](examples/recipe-contributor.json): its wake policies serve both modes, and the launcher reads this mode's variables from the same environment file.
+
+## Checks emission
+
+Set `GITHUB_CHECKS_EMIT=failures` to avoid green-CI wakes in token polling,
+App polling and both `check_suite.completed` and `check_run.completed` webhooks.
+Unset or `all` preserves the previous event payloads and delivery behavior,
+including legacy summary handling of `stale` and `startup_failure`. Values are
+case-sensitive, with surrounding whitespace trimmed; empty or other values
+refuse startup. Other event kinds are unaffected.
+
+In `failures` mode:
+
+- Emit for `failure`, `cancelled`, `timed_out`, `action_required`,
+  `startup_failure` and `stale`; suppress `success`, `neutral` and `skipped`.
+- Summarize all check runs on the head SHA, not only the suite that triggered
+  a webhook. Any failing run wins over green runs; the summary priority is
+  `startup_failure`, `failure`, `timed_out`, `cancelled`, `action_required`,
+  then `stale`. Every failing run contributes its name and URL, up to the
+  existing list limit. All-green mixtures summarize as `success`.
+- Pending or truncated reads with no known failure remain undecided. A known
+  failure can emit while other runs are pending or unread, as before. Empty
+  poll results do not emit. Webhooks use the resolved summary when available;
+  if the lookup fails, has no runs, or no API is supplied, they filter the
+  payload conclusion instead. Null/unknown payload conclusions are suppressed.
+- Suppression counts as a handled result, not a refused delivery: poll keys
+  are recorded in the existing durable state and heads settle/retire normally.
+  App polling and webhooks also commit the suppressed mark through their
+  shared, serialized SHA gate. A suppressed green result is not queued to
+  wake the agent later, including after restart with this option retained.
+- A **later failing rerun on the same SHA can still emit**. Token mode observes
+  it when the PR updates or its ten-minute head-read TTL expires, and emits
+  once per conclusion/failed-job set. App polling observes it when a PR row
+  is read again; webhooks observe it on the next completed delivery. Their
+  existing gate allows stronger conclusions or new failed-job names, not
+  repeated or weaker results. Refused failing events remain retryable.
+
+These are the existing bounded dedup windows, not a permanent once-per-SHA
+ledger. Poll keys survive restart when `GITHUB_STATE_FILE` is configured;
+webhook delivery IDs and SHA marks remain in memory as before. Filtering still
+suppresses green results after eviction/restart. Opting in also makes check
+summaries returned by tools recognize `stale` and `startup_failure` as failures.
+This option reduces event delivery, not GitHub polling/API usage.
 
 ## Plain-MCP mode
 

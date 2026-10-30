@@ -15,6 +15,8 @@
 import { createHash } from 'node:crypto';
 import {
   parseRepoSlug,
+  CHECK_FAILURE_CONCLUSIONS,
+  type ChecksEmit,
   type CheckConclusion,
   type ChecksSummary,
   type DiffSide,
@@ -138,8 +140,9 @@ const CHECK_CONCLUSIONS: readonly CheckConclusion[] = [
   'stale',
 ];
 
-function conclusionFrom(value: unknown): CheckConclusion | null {
+function conclusionFrom(value: unknown, checksEmit: ChecksEmit): CheckConclusion | null {
   const raw = asString(value);
+  if (checksEmit === 'failures' && raw === 'startup_failure') return raw;
   return raw && (CHECK_CONCLUSIONS as readonly string[]).includes(raw) ? (raw as CheckConclusion) : null;
 }
 
@@ -231,7 +234,7 @@ export const HANDLED_WEBHOOK_EVENTS: readonly string[] = [
  * Only `check_suite`/`check_run` can return more than one event, one per head
  * sha (§Ingress); the ids are then `<delivery>#<n>`.
  */
-export function normalizeWebhook(delivery: WebhookDelivery): NormalizedEvent[] {
+export function normalizeWebhook(delivery: WebhookDelivery, checksEmit: ChecksEmit = 'all'): NormalizedEvent[] {
   const { payload } = delivery;
   const repo = repoFrom(payload);
   if (!repo) return [];
@@ -360,10 +363,10 @@ export function normalizeWebhook(delivery: WebhookDelivery): NormalizedEvent[] {
     }
 
     case 'check_suite':
-      return action === 'completed' ? normalizeCheckSuite(base, payload, actor) : [];
+      return action === 'completed' ? normalizeCheckSuite(base, payload, actor, checksEmit) : [];
 
     case 'check_run':
-      return action === 'completed' ? normalizeCheckRun(base, payload, actor) : [];
+      return action === 'completed' ? normalizeCheckRun(base, payload, actor, checksEmit) : [];
 
     case 'push': {
       const after = asString(at(payload, 'after'));
@@ -387,7 +390,7 @@ type EventBase = Pick<NormalizedEvent, 'id' | 'receivedAt' | 'repo' | 'raw'>;
  * event. `failed` is filled from the payload's own check runs if it carries
  * any and otherwise by {@link resolveCheckEvents}.
  */
-function normalizeCheckSuite(base: EventBase, payload: unknown, actor: EventActor | undefined): NormalizedEvent[] {
+function normalizeCheckSuite(base: EventBase, payload: unknown, actor: EventActor | undefined, checksEmit: ChecksEmit): NormalizedEvent[] {
   const suite = asObject(at(payload, 'check_suite'));
   if (!suite) return [];
   const sha = asString(suite.head_sha);
@@ -409,7 +412,7 @@ function normalizeCheckSuite(base: EventBase, payload: unknown, actor: EventActo
       actor: actor ?? { login: asString(at(suite, 'app', 'slug')) ?? 'github', isBot: true },
       html_url,
       sha,
-      checks: { conclusion: conclusionFrom(suite.conclusion), failed: [] },
+      checks: { conclusion: conclusionFrom(suite.conclusion, checksEmit), failed: [] },
     },
   ];
 }
@@ -422,15 +425,16 @@ function normalizeCheckSuite(base: EventBase, payload: unknown, actor: EventActo
  * deliveries for one sha; they carry distinct delivery ids, so the dedup ring
  * does not merge them.
  */
-function normalizeCheckRun(base: EventBase, payload: unknown, actor: EventActor | undefined): NormalizedEvent[] {
+function normalizeCheckRun(base: EventBase, payload: unknown, actor: EventActor | undefined, checksEmit: ChecksEmit): NormalizedEvent[] {
   const run = asObject(at(payload, 'check_run'));
   if (!run) return [];
   const sha = asString(run.head_sha) ?? asString(at(run, 'check_suite', 'head_sha'));
   if (!sha) return [];
-  const conclusion = conclusionFrom(run.conclusion);
+  const conclusion = conclusionFrom(run.conclusion, checksEmit);
   const name = asString(run.name);
   const url = asString(run.html_url);
   const failed: FailedCheck[] =
+    (checksEmit === 'failures' && conclusion !== null && CHECK_FAILURE_CONCLUSIONS.includes(conclusion)) ||
     conclusion === 'failure' || conclusion === 'timed_out' || conclusion === 'action_required'
       ? [{ name: name ?? 'check', url: url ?? '' }]
       : [];
@@ -711,12 +715,22 @@ export function normalizeNotifiedReviewRequest(
  *      trace, so the next emission for that sha — the retry, or the other
  *      path — still gets to deliver it.
  *
+ * With failure-only emission, deliberate suppression is also an accepted
+ * handling: it commits through the same gate without calling the listener.
+ * A later failure is stronger than a suppressed green mark and may emit.
+ *
  * There is deliberately no reservation, no provisional entry and no rollback:
- * the only writes are commits, and a commit means "the listener has this".
+ * the only writes are commits, and a commit means "this result was handled".
  * Two earlier designs tried to make a claim-then-release state machine safe
  * and each left a window where a refusal erased a newer accepted result or a
  * pending claim hid work from the poller.
  */
+
+/** Filter only checks events, after resolving the whole head's summary. */
+export function shouldEmitChecks(event: NormalizedEvent, mode: ChecksEmit): boolean {
+  return mode === 'all' || event.kind !== 'checks.completed' ||
+    (event.checks?.conclusion != null && CHECK_FAILURE_CONCLUSIONS.includes(event.checks.conclusion));
+}
 
 /** A {@link ChecksSummary} whose runs have all finished. */
 export type CompletedChecksSummary = ChecksSummary & { conclusion: CheckConclusion };
@@ -851,6 +865,7 @@ const CONCLUSION_SEVERITY: Record<CheckConclusion, number> = {
   action_required: 5,
   timed_out: 6,
   failure: 7,
+  startup_failure: 8,
 };
 
 function severity(conclusion: CheckConclusion | null): number {
@@ -858,8 +873,8 @@ function severity(conclusion: CheckConclusion | null): number {
 }
 
 /**
- * What a head sha has already told the listener — the *committed* record, only
- * ever written after an accepted delivery.
+ * What a head sha has already handled — the *committed* record, only ever
+ * written after an accepted delivery or deliberate emission-policy suppression.
  *
  * It accumulates rather than replaces: `rank` is the worst conclusion seen and
  * `failed` the union of the job names reported. That is what makes an older
@@ -927,7 +942,7 @@ export class CheckGate {
     return `${repo.owner}/${repo.name}@${sha}`;
   }
 
-  /** What the listener has already accepted for this head sha, if anything. */
+  /** What was accepted or deliberately suppressed for this head sha, if anything. */
   committedMark(repo: RepoRef, sha: string): CheckMark | undefined {
     return this.committed.get(CheckGate.key(repo, sha));
   }

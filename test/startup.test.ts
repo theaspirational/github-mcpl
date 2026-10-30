@@ -205,3 +205,30 @@ for (const failure of ['404', 'mismatch']) {
     assert.deepEqual(r.stats, { started: 8, completed: 3, aborted: 5, active: 0, peak: 8 });
   });
 }
+
+test('checks emission config defaults to all, accepts failures, and rejects invalid values', (t) => {
+  const env = { GITHUB_TOKEN_FILE: tokenFile(t), GITHUB_REPOS: 'owner/repo0' };
+  assert.equal(readConfig(env).checksEmit, 'all');
+  assert.equal(readConfig({ ...env, GITHUB_CHECKS_EMIT: 'all' }).checksEmit, 'all');
+  assert.equal(readConfig({ ...env, GITHUB_CHECKS_EMIT: ' failures ' }).checksEmit, 'failures');
+  for (const value of ['', ' ', 'failure', 'ALL', 'no']) {
+    assert.throws(() => readConfig({ ...env, GITHUB_CHECKS_EMIT: value }), /GITHUB_CHECKS_EMIT: must be all or failures/);
+  }
+});
+
+test('CLI refuses an invalid checks emission option before adapter startup', { timeout: 5000 }, async (t) => {
+  const child = spawn(process.execPath, ['--import', 'tsx', fileURLToPath(new URL('../src/index.ts', import.meta.url)), '--stdio'], {
+    env: { PATH: process.env.PATH, GITHUB_TOKEN_FILE: tokenFile(t), GITHUB_REPOS: 'owner/repo0', GITHUB_CHECKS_EMIT: 'invalid' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  t.after(() => { if (child.exitCode === null) child.kill('SIGKILL'); });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (chunk) => { stdout += chunk; });
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  const code = await new Promise((resolve, reject) => { child.on('error', reject); child.on('close', resolve); });
+  assert.equal(code, 1);
+  assert.equal(stdout, '');
+  assert.match(stderr, /GITHUB_CHECKS_EMIT: must be all or failures/);
+  assert.doesNotMatch(stderr, /starting|polling notifications|adapter failed/);
+});

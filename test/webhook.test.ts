@@ -1,3 +1,5 @@
+import { summarizeChecks } from '../src/github-adapter.js';
+import { checksCases, checkRuns } from './checks-cases.js';
 /**
  * Webhook listener (TASK-SRHKG.1.3): the order of the checks is the test.
  *
@@ -63,6 +65,7 @@ interface Rig {
 }
 
 interface RigOptions {
+  checksEmit?: 'all' | 'failures';
   repos?: readonly RepoRef[];
   api?: FakeGitHubApi;
   path?: string;
@@ -83,12 +86,14 @@ async function rig(t: TestContext, opts: RigOptions = {}): Promise<Rig> {
     : opts.api;
   const listener = new WebhookListener({
     secret: SECRET,
+    now: () => new Date('2026-10-14T00:00:00Z'),
     path,
     repos: opts.repos ?? [TEST_REPO],
     logger: log,
     api,
     maxBodyBytes: opts.maxBodyBytes,
     checkGate: opts.checkGate,
+    checksEmit: opts.checksEmit,
     onEvent: async (event) => {
       events.push(event);
       await opts.onEvent?.(event);
@@ -394,6 +399,7 @@ function config(overrides: Partial<Config> = {}): Config {
     webhookPort: 8081,
     webhookPath: '/github/webhook',
     pollIntervalMs: 0,
+    checksEmit: 'all',
     repos: [TEST_REPO],
     prBaseAllow: ['dev'],
     mergeBaseAllow: [],
@@ -838,4 +844,113 @@ test('a webhook refusal after the cursor passed the row does not cost the poll i
   assert.equal(second.checksBacklog, 0, 'retired only because its own delivery was accepted');
   assert.deepEqual(polled.filter((e) => e.kind === 'checks.completed').length, 1);
   assert.deepEqual(gate.committedMark(TEST_REPO, pull.head.sha), { rank: 7, failed: ['clippy'] });
+});
+
+for (const scenario of checksCases) {
+  test(`webhook checks filter: ${scenario.name}, with byte-identical default/all output`, async (t) => {
+    for (const kind of ['check_suite', 'check_run']) {
+      const outputs: string[] = [];
+      for (const checksEmit of [undefined, 'all', 'failures'] as const) {
+        const r = await rig(t, { checksEmit,
+          getCheckRuns: async (_repo, sha) => summarizeChecks(sha, checkRuns(scenario.conclusions), { checksEmit }),
+        });
+        await r.deliver(kind, fixture(`${kind}.completed.json`), 'filter-1');
+        await r.listener.whenIdle();
+        assert.equal(r.events.length, checksEmit !== 'failures' || scenario.emits ? 1 : 0);
+        outputs.push(JSON.stringify(r.events));
+        await r.deliver(kind, fixture(`${kind}.completed.json`), 'filter-2');
+        await r.listener.whenIdle();
+        assert.equal(r.events.length, checksEmit !== 'failures' || scenario.emits ? 1 : 0);
+      }
+      assert.equal(outputs[0], outputs[1]);
+    }
+  });
+}
+
+for (const kind of ['check_suite', 'check_run']) {
+  test(`webhook ${kind}: fallback filters payload conclusions when lookup fails, is empty or absent`, async (t) => {
+    for (const lookup of ['absent', 'failed', 'empty']) {
+      const r = await rig(t, { checksEmit: 'failures', ...(lookup === 'absent' ? {} : {
+        getCheckRuns: async (_repo: RepoRef, sha: string) => {
+          if (lookup === 'failed') throw new Error('unavailable');
+          return { sha, total: 0, conclusion: null, failed: [] };
+        },
+      }) });
+      for (const [i, conclusion] of ['success', 'neutral', 'skipped', null, 'unknown', 'failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale'].entries()) {
+        const payload = JSON.parse(fixture(`${kind}.completed.json`));
+        payload[kind].conclusion = conclusion;
+        payload[kind].head_sha = `sha-${i}`;
+        await r.deliver(kind, JSON.stringify(payload));
+        await r.listener.whenIdle();
+      }
+      assert.deepEqual(r.events.map((e) => e.checks?.conclusion), ['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale']);
+      await r.deliver('issues', fixture('issues.opened.json'));
+      await r.listener.whenIdle();
+      assert.equal(r.events.at(-1)?.kind, 'issue.opened');
+    }
+  });
+}
+
+test('webhook suppressed green mark permits a failing rerun, but no repeated failure or late green', async (t) => {
+  const gate = new CheckGate();
+  let conclusion: 'success' | 'failure' = 'success';
+  const r = await rig(t, { checksEmit: 'failures', checkGate: gate,
+    getCheckRuns: async (_repo, sha) => summarizeChecks(sha, checkRuns([conclusion])),
+  });
+  await r.deliver('check_suite', suiteFor(HEAD));
+  await r.listener.whenIdle();
+  assert.equal(gate.committedMark(TEST_REPO, HEAD)?.rank, 0);
+  conclusion = 'failure';
+  await r.deliver('check_run', fixture('check_run.completed.json'));
+  await r.listener.whenIdle();
+  await r.deliver('check_suite', suiteFor(HEAD));
+  await r.listener.whenIdle();
+  conclusion = 'success';
+  await r.deliver('check_suite', suiteFor(HEAD));
+  await r.listener.whenIdle();
+  assert.deepEqual(r.events.map((e) => e.checks?.conclusion), ['failure']);
+});
+
+test('failure-only poll and webhook share suppressed marks, then deliver a failing rerun only once', async (t) => {
+  const gate = new CheckGate();
+  const api = new FakeGitHubApi();
+  const pull = api.seedPullRequest({ number: 58, updatedAt: '2026-10-13T12:00:00Z' });
+  api.seedCheckRuns(TEST_REPO, summarizeChecks(pull.head.sha, checkRuns(['success'])));
+  const state = pollState('2026-10-13T00:00:00Z');
+  const polled: NormalizedEvent[] = [];
+  const poller = new Poller({ api, state, repos: [TEST_REPO], intervalMs: 60_000,
+    checkGate: gate, checksEmit: 'failures', now: () => new Date('2026-10-14T00:00:00Z'),
+    onEvent: (event) => { polled.push(event); },
+  });
+  const r = await rig(t, { api, checkGate: gate, checksEmit: 'failures' });
+  const pass = async () => {
+    const [result] = await Promise.all([poller.pollOnce(), r.deliver('check_suite', suiteFor(pull.head.sha))]);
+    await r.listener.whenIdle();
+    assert.equal(result.checksBacklog, 0);
+    return [...polled, ...r.events].filter((e) => e.kind === 'checks.completed');
+  };
+  assert.equal((await pass()).length, 0);
+  assert.equal(gate.committedMark(TEST_REPO, pull.head.sha)?.rank, 0);
+  assert.ok(state.snapshot().pollKeys.some((key) => key.startsWith(`checks:${pull.head.sha}:success:`)));
+  api.seedCheckRuns(TEST_REPO, summarizeChecks(pull.head.sha, checkRuns(['failure'])));
+  api.seedPullRequest({ number: 58, head: pull.head, updatedAt: '2026-10-14T01:00:00Z' });
+  assert.deepEqual((await pass()).map((e) => e.checks?.conclusion), ['failure']);
+});
+
+test('webhook config factory wires failure-only policy into the signed HTTP path', async (t) => {
+  const events: NormalizedEvent[] = [];
+  const listener = webhookListenerFromConfig(config({ checksEmit: 'failures' }), {
+    onEvent: (event) => { events.push(event); },
+    api: { getCheckRuns: async (_repo, sha) => summarizeChecks(sha, checkRuns(['success'])) },
+  })!;
+  const port = await listener.listen(0);
+  t.after(() => listener.close());
+  const body = fixture('check_suite.completed.json');
+  const response = await fetch(`http://127.0.0.1:${port}/github/webhook`, {
+    method: 'POST', body, headers: { 'x-github-event': 'check_suite', 'x-github-delivery': 'configured-filter',
+      'x-hub-signature-256': `sha256=${createHmac('sha256', SECRET).update(body).digest('hex')}` },
+  });
+  assert.equal(response.status, 202);
+  await listener.whenIdle();
+  assert.equal(events.length, 0);
 });

@@ -128,6 +128,7 @@ async function build(config: Config, log: Logger): Promise<{ server: GitHubMcplS
       intervalMs: config.pollIntervalMs,
       repos: config.repos,
       login: config.botLogin,
+      checksEmit: config.checksEmit,
       onEvent: server.onEvent,
       canPoll: server.canReceiveEvents,
       logger: log,
@@ -160,6 +161,7 @@ async function build(config: Config, log: Logger): Promise<{ server: GitHubMcplS
           onEvent: server.onEvent,
           logger: log,
           checkGate,
+          checksEmit: config.checksEmit,
         });
   if (poller) {
     poller.start();

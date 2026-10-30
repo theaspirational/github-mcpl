@@ -1,3 +1,5 @@
+import { summarizeChecks } from '../src/github-adapter.js';
+import { checksCases, checkRuns } from './checks-cases.js';
 /**
  * Contributor mode's notifications poller (anima-research/github-mcpl#5).
  *
@@ -10,7 +12,7 @@
  */
 
 import { strict as assert } from 'node:assert';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -171,7 +173,7 @@ interface Rig {
   setNow(at: string): void;
 }
 
-function rig(options: { stateFile?: string | null; state?: GithubState; github?: FakeGitHub; repos?: RepoRef[]; login?: string } = {}): Rig {
+function rig(options: { checksEmit?: 'all' | 'failures'; stateFile?: string | null; state?: GithubState; github?: FakeGitHub; repos?: RepoRef[]; login?: string } = {}): Rig {
   const github = options.github ?? new FakeGitHub();
   const state = options.state ?? GithubState.load(options.stateFile ?? null);
   const events: NormalizedEvent[] = [];
@@ -183,6 +185,7 @@ function rig(options: { stateFile?: string | null; state?: GithubState; github?:
   let now = Date.parse(START);
   const poller = new NotificationsPoller({
     api: github,
+    checksEmit: options.checksEmit,
     state,
     intervalMs: MIN_POLL_INTERVAL_MS,
     repos: options.repos ?? [REPO],
@@ -950,7 +953,7 @@ test('state is flushed as a pass goes, so a process restarted after a pass repea
   const result = await restarted.poller.pollOnce();
   assert.equal(result.threads, 1);
   assert.equal(result.duplicates, 1);
-  assert.deepEqual(restarted.events, []);
+  assert.equal(restarted.events.length, 0);
 });
 
 test('each thread\'s state is on disk before the next thread is read', async () => {
@@ -1657,4 +1660,50 @@ test('host readiness: revoking egress pauses an outstanding retry without consum
   await grant(h, ['channels.register', 'channels.incoming']);
   assert.equal((await poller.pollOnce()).delivered.length, 1);
   assert.deepEqual(r.state.notificationRetries(), []);
+});
+
+for (const scenario of checksCases) {
+  test(`token checks filter: ${scenario.name}, with byte-identical default/all output`, async () => {
+    const outputs: string[] = [];
+    for (const checksEmit of [undefined, 'all', 'failures'] as const) {
+      const r = rig({ login: 'a-human', checksEmit });
+      r.github.ownPulls = [own('2026-10-15T00:09:00Z')];
+      r.github.heads.set(channelId(PULL), 'sha-filter');
+      r.github.checks.set('sha-filter', summarizeChecks('sha-filter', checkRuns(scenario.conclusions), { checksEmit }));
+      const result = await r.poller.pollOnce();
+      assert.equal(r.events.length, checksEmit !== 'failures' || scenario.emits ? 1 : 0);
+      assert.deepEqual(result.delivered, r.events);
+      outputs.push(JSON.stringify(r.events));
+      assert.equal((await r.poller.pollOnce()).checkLookups, 0, 'suppressed heads settle too');
+      assert.ok(r.state.snapshot().pollKeys.some((key) => key.includes('checks:sha-filter:')));
+    }
+    assert.equal(outputs[0], outputs[1]);
+  });
+}
+
+test('token suppression persists across restart; a failing rerun on the same sha emits once and retries refusal', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'github-checks-filter-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const stateFile = join(dir, 'state.json');
+  const r = rig({ login: 'a-human', checksEmit: 'failures', stateFile });
+  r.github.ownPulls = [own('2026-10-15T00:09:00Z')];
+  r.github.heads.set(channelId(PULL), 'sha-filter');
+  r.github.checks.set('sha-filter', summarizeChecks('sha-filter', checkRuns(['success'])));
+  await r.poller.pollOnce();
+  const restarted = rig({ login: 'a-human', checksEmit: 'failures', stateFile, github: r.github });
+  assert.ok(restarted.state.snapshot().pollKeys.some((key) => key.includes('checks:sha-filter:success:')));
+  assert.equal((await restarted.poller.pollOnce()).duplicates, 1);
+  assert.equal(restarted.events.length, 0);
+  r.github.checks.set('sha-filter', summarizeChecks('sha-filter', checkRuns(['failure'])));
+  restarted.setNow('2026-10-15T00:20:00Z');
+  const id = `poll:${checksPollKey(summarizeChecks('sha-filter', checkRuns(['failure'])) as Parameters<typeof checksPollKey>[0])}`;
+  restarted.refuse.add(id);
+  await restarted.poller.pollOnce();
+  assert.equal(restarted.events.length, 0);
+  restarted.refuse.clear();
+  await restarted.poller.pollOnce();
+  assert.deepEqual(restarted.events.map((e) => e.checks?.conclusion), ['failure']);
+  restarted.setNow('2026-10-15T00:30:00Z');
+  await restarted.poller.pollOnce();
+  assert.equal(restarted.events.length, 1);
 });

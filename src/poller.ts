@@ -26,6 +26,7 @@
  */
 
 import {
+  shouldEmitChecks,
   atOrAfter,
   CheckGate,
   checkMarkOf,
@@ -46,6 +47,7 @@ import {
   type GitHubApi,
   type Logger,
   type ChecksSummary,
+  type ChecksEmit,
   type NormalizedEvent,
   type PolledComment,
   type PolledIssue,
@@ -115,6 +117,8 @@ export interface IngressState {
 }
 
 export interface PollerOptions {
+  /** GITHUB_CHECKS_EMIT; omitted preserves all legacy events. */
+  checksEmit?: ChecksEmit;
   api: PollerApi;
   /** GITHUB_REPOS. The poller only ever asks these repositories. */
   repos: readonly RepoRef[];
@@ -175,9 +179,10 @@ export interface PollResult {
  */
 /**
  * What became of one hand-off: the listener took it, or another accepted
- * emission for the same head sha already covered it. A refusal throws.
+ * emission for the same head sha already covered it, or the emission policy
+ * suppressed it. A refusal throws.
  */
-type HandOff = 'delivered' | 'covered';
+type HandOff = 'delivered' | 'covered' | 'suppressed';
 
 interface PendingHead {
   repo: RepoRef;
@@ -245,6 +250,7 @@ export class Poller {
   private readonly state: IngressState;
   private readonly configuredIntervalMs: number;
   private readonly onEvent: EventListener;
+  private readonly checksEmit: ChecksEmit;
   private readonly logger: Logger;
   private readonly now: () => Date;
   private readonly maxCheckedPulls: number;
@@ -264,6 +270,7 @@ export class Poller {
   private pass: Promise<unknown> = Promise.resolve();
 
   constructor(opts: PollerOptions) {
+    this.checksEmit = opts.checksEmit ?? 'all';
     this.api = opts.api;
     this.repos = opts.repos;
     this.state = opts.state;
@@ -457,10 +464,10 @@ export class Poller {
         continue;
       }
 
-      // Recorded only now, after the listener took it.
+      // Record accepted or deliberately suppressed results, never refused ones.
       this.state.seenPollKey(candidate.key);
       deliveredThisPass.add(candidate.key);
-      result.delivered.push(candidate.event);
+      if (outcome !== 'suppressed') result.delivered.push(candidate.event);
       retire();
       commitHead();
     }
@@ -681,9 +688,12 @@ export class Poller {
       await this.onEvent(event);
       return 'delivered';
     }
+    const emit = shouldEmitChecks(event, this.checksEmit);
     const delivered = await this.checkGate.emit(event.repo, event.sha as string, mark, async () => {
-      await this.onEvent(event);
+      // Commit suppression through the same serialized gate as delivery.
+      if (emit) await this.onEvent(event);
     });
+    if (!emit) return 'suppressed';
     return delivered ? 'delivered' : 'covered';
   }
 

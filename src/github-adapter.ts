@@ -40,6 +40,8 @@ import {
   repoSlug,
   stderrLogger,
   type BotIdentity,
+  CHECK_FAILURE_CONCLUSIONS,
+  type ChecksEmit,
   type CheckConclusion,
   type ChecksSummary,
   type Comment,
@@ -612,10 +614,9 @@ function hasNextPage(link: string | undefined): boolean {
 }
 
 /**
- * Roll a sha's check runs up to one conclusion. A run that has not completed
- * makes the whole sha undecided (`null`); otherwise the worst conclusion wins,
- * and `neutral`/`skipped`/`stale` are not failures — GitHub's own required-check
- * semantics treat them as passing.
+ * Legacy failure set, kept unchanged for default/all output parity. The
+ * opt-in policy also counts startup_failure and stale as failures, using
+ * CHECK_FAILURE_CONCLUSIONS. A known failure wins even with unfinished runs.
  */
 const FAILING_CONCLUSIONS: readonly CheckConclusion[] = [
   'failure',
@@ -1331,7 +1332,7 @@ export class GitHubAdapter implements GitHubApi {
         { sha, read: runs.length, total: totalCount },
       );
     }
-    return summarizeChecks(sha, runs, { total: Math.max(totalCount, runs.length), truncated });
+    return summarizeChecks(sha, runs, { total: Math.max(totalCount, runs.length), truncated, checksEmit: this.config.checksEmit });
   }
 
   /**
@@ -2611,13 +2612,15 @@ function numberOrNull(value: string | undefined): number | null {
  * `total` defaults to the number of rows given; pass GitHub's `total_count`
  * when the read was paginated. `truncated` says rows were left unread, and a
  * truncated summary never claims `success` — it cannot know what is on the
- * page it did not fetch.
+ * page it did not fetch. `checksEmit: failures` opts into the expanded failure
+ * set; omitted/all deliberately retains legacy stale/startup_failure handling.
  */
 export function summarizeChecks(
   sha: string,
   runs: CheckRunRow[],
-  options: { total?: number; truncated?: boolean } = {},
+  options: { total?: number; truncated?: boolean; checksEmit?: ChecksEmit } = {},
 ): ChecksSummary {
+  const failing = options.checksEmit === 'failures' ? CHECK_FAILURE_CONCLUSIONS : FAILING_CONCLUSIONS;
   const failed: FailedCheck[] = [];
   let incomplete = options.truncated === true;
   let worst: CheckConclusion | null = null;
@@ -2628,10 +2631,10 @@ export function summarizeChecks(
       continue;
     }
     const conclusion = run.conclusion as CheckConclusion | null | undefined;
-    if (conclusion && FAILING_CONCLUSIONS.includes(conclusion)) {
+    if (conclusion && failing.includes(conclusion)) {
       failed.push({ name: run.name ?? '', url: run.html_url ?? '' });
-      const rank = FAILING_CONCLUSIONS.indexOf(conclusion);
-      if (worst === null || rank < FAILING_CONCLUSIONS.indexOf(worst)) worst = conclusion;
+      const rank = failing.indexOf(conclusion);
+      if (worst === null || rank < failing.indexOf(worst)) worst = conclusion;
     }
   }
 
