@@ -1707,3 +1707,43 @@ test('token suppression persists across restart; a failing rerun on the same sha
   await restarted.poller.pollOnce();
   assert.equal(restarted.events.length, 1);
 });
+
+for (const checksEmit of ['all', 'failures'] as const) {
+  for (const passing of ['stale', 'success'] as const) {
+    test(`token ${checksEmit}: ${passing} plus pending stays unsettled until the real failure`, async () => {
+      const r = rig({ login: 'a-human', checksEmit });
+      r.github.ownPulls = [own('2026-10-15T00:09:00Z')];
+      r.github.heads.set(channelId(PULL), 'sha-pending');
+      const summary = (finished: boolean) => summarizeChecks('sha-pending', [
+        ...checkRuns([passing]),
+        { name: 'running-job', status: finished ? 'completed' : 'in_progress', conclusion: finished ? 'failure' : null, html_url: 'https://ci/running' },
+      ], { checksEmit });
+      r.github.checks.set('sha-pending', summary(false));
+      for (let pass = 0; pass < 2; pass++) {
+        assert.equal((await r.poller.pollOnce()).checkLookups, 1);
+        assert.equal(r.events.length, 0);
+      }
+      assert.equal(r.state.snapshot().pollKeys.some((key) => key.includes('checks:sha-pending:')), false);
+      r.github.checks.set('sha-pending', summary(true));
+      assert.equal((await r.poller.pollOnce()).checkLookups, 1);
+      assert.deepEqual(r.events.map((e) => e.checks), [{ conclusion: 'failure', failed: [{ name: 'running-job', url: 'https://ci/running' }] }]);
+      assert.equal((await r.poller.pollOnce()).checkLookups, 0);
+    });
+  }
+}
+
+test('token default checks payload is pinned to the pre-option success event', async () => {
+  const r = rig({ login: 'a-human' });
+  r.github.ownPulls = [own('2026-10-15T00:09:00Z')];
+  r.github.heads.set(channelId(PULL), 'sha-default');
+  r.github.checks.set('sha-default', { sha: 'sha-default', conclusion: 'success', total: 1, failed: [] });
+  await r.poller.pollOnce();
+  assert.deepEqual(r.events, [{
+    id: 'poll:checks:sha-default:success:0:da39a3ee5e6b', receivedAt: '2026-10-15T00:10:00.000Z',
+    repo: { owner: 'anima-research', name: 'rayforce' }, kind: 'checks.completed',
+    thread: { repo: { owner: 'anima-research', name: 'rayforce' }, number: 12, kind: 'pull' },
+    actor: { login: 'github', isBot: true }, html_url: 'https://github.com/anima-research/rayforce/pull/12',
+    sha: 'sha-default', checks: { conclusion: 'success', failed: [] },
+    raw: { sha: 'sha-default', conclusion: 'success', total: 1, failed: [] },
+  }]);
+});

@@ -393,19 +393,23 @@ refuse startup. Other event kinds are unaffected.
 In `failures` mode:
 
 - Emit for `failure`, `cancelled`, `timed_out`, `action_required`,
-  `startup_failure` and `stale`; suppress `success`, `neutral` and `skipped`.
+  `startup_failure`; suppress `success`, `neutral`, `skipped` and `stale`.
 - Summarize all check runs on the head SHA, not only the suite that triggered
   a webhook. Any failing run wins over green runs; the summary priority is
-  `startup_failure`, `failure`, `timed_out`, `cancelled`, `action_required`,
-  then `stale`. Every failing run contributes its name and URL, up to the
+  `startup_failure`, `failure`, `timed_out`, `cancelled`, then `action_required`.
+  Every failing run contributes its name and URL, up to the
   existing list limit. All-green mixtures summarize as `success`.
 - Pending or truncated reads with no known failure remain undecided. A known
-  failure can emit while other runs are pending or unread, as before. Empty
+  failure can emit while other runs are pending or unread (the legacy failure
+  set in both modes, plus `startup_failure` in failures mode). A stale run is
+  passing in both modes: stale plus a pending run stays undecided. Empty
   poll results do not emit. Webhooks use the resolved summary when available;
   if the lookup fails, has no runs, or no API is supplied, they filter the
   payload conclusion instead. Null/unknown payload conclusions are suppressed.
 - Suppression counts as a handled result, not a refused delivery: poll keys
-  are recorded in the existing durable state and heads settle/retire normally.
+  are recorded in the existing durable state for newly handled results;
+  results already covered by the shared SHA gate follow the existing covered
+  path. Heads settle/retire only once their summary is decided.
   App polling and webhooks also commit the suppressed mark through their
   shared, serialized SHA gate. A suppressed green result is not queued to
   wake the agent later, including after restart with this option retained.
@@ -420,8 +424,11 @@ These are the existing bounded dedup windows, not a permanent once-per-SHA
 ledger. Poll keys survive restart when `GITHUB_STATE_FILE` is configured;
 webhook delivery IDs and SHA marks remain in memory as before. Filtering still
 suppresses green results after eviction/restart. Opting in also makes check
-summaries returned by tools recognize `stale` and `startup_failure` as failures.
-This option reduces event delivery, not GitHub polling/API usage.
+summaries returned by tools recognize `startup_failure` as a failure; `stale`
+remains passing. Filtering does not change the polling interval or add API
+calls. Recognition of `startup_failure` can decide an unfinished head earlier
+than in all mode, retiring an App polling head earlier; token mode keeps
+checking unfinished heads. Stale runs do not cause this early retirement.
 
 ## Plain-MCP mode
 

@@ -541,3 +541,16 @@ test('every keyed family lists the values the github: tags use', () => {
     assert.ok(family.values?.includes(value), `${key} family omits ${value}`);
   }
 });
+
+test('checks documentation: cancelled/startup_failure tags depend on the failed list; stale is passing', () => {
+  for (const conclusion of ['cancelled', 'startup_failure'] as const) {
+    for (const failed of [[], [{ name: 'job', url: 'https://ci/job' }]]) {
+      const result = tagsFor(event('checks.completed', { checks: { conclusion, failed } }), ctx());
+      assert.equal(result.tags.includes('github:ci=failure'), failed.length > 0);
+      assert.equal(result.metadata.isCiFailure, failed.length > 0);
+    }
+  }
+  const stale = tagsFor(event('checks.completed', { checks: { conclusion: 'stale', failed: [] } }), ctx());
+  assert.equal(stale.tags.includes('github:ci=failure'), false);
+  assert.equal(stale.metadata.isCiFailure, false);
+});

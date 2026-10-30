@@ -1349,3 +1349,57 @@ test('App poll suppression survives disk reload and a fresh gate, then permits a
   assert.deepEqual(events.filter((e) => e.kind === 'checks.completed').map((e) => e.checks?.conclusion), ['failure']);
   await restored.flush();
 });
+
+for (const checksEmit of ['all', 'failures'] as const) {
+  for (const passing of ['stale', 'success'] as const) {
+    test(`App ${checksEmit}: ${passing} plus pending retains the head until its real failure`, async () => {
+      let finished = false;
+      const r = rig({ checksEmit, getCheckRuns: async (_repo, sha) => summarizeChecks(sha, [
+        ...checkRuns([passing]),
+        { name: 'running-job', status: finished ? 'completed' : 'in_progress', conclusion: finished ? 'failure' : null, html_url: 'https://ci/running' },
+      ], { checksEmit }) });
+      r.api.seedPullRequest({ number: 58, updatedAt: '2026-10-13T12:00:00Z' });
+      const first = await r.poller.pollOnce();
+      assert.equal(first.checksBacklog, 1);
+      assert.equal(first.delivered.filter((e) => e.kind === 'checks.completed').length, 0);
+      // The PR row appears once; only the retained backlog can find the verdict.
+      r.api.listIssuesSince = async () => ({ rows: [], through: true });
+      const second = await r.poller.pollOnce();
+      assert.equal(second.checkLookups, 1);
+      assert.equal(second.checksBacklog, 1);
+      assert.equal(second.delivered.length, 0);
+      finished = true;
+      const third = await r.poller.pollOnce();
+      assert.equal(third.checkLookups, 1);
+      assert.equal(third.checksBacklog, 0);
+      assert.deepEqual(third.delivered.map((e) => e.checks), [{ conclusion: 'failure', failed: [{ name: 'running-job', url: 'https://ci/running' }] }]);
+      assert.equal(r.checkCalls.length, 3);
+    });
+  }
+}
+
+test('App covered suppression follows the same ring and duplicate path as covered delivery', async () => {
+  const gate = new CheckGate();
+  const r = rig({ checkGate: gate, checksEmit: 'failures', getCheckRuns: async (_repo, sha) => summarizeChecks(sha, checkRuns(['success'])) });
+  const pull = r.api.seedPullRequest({ number: 58, updatedAt: '2026-10-13T12:00:00Z' });
+  await gate.emit(TEST_REPO, pull.head.sha, { rank: 0, failed: [] }, async () => {});
+  const result = await r.poller.pollOnce();
+  assert.equal(result.duplicates, 1);
+  assert.equal(result.checksBacklog, 0);
+  assert.equal(result.delivered.filter((e) => e.kind === 'checks.completed').length, 0);
+  assert.equal(r.state.snapshot().pollKeys.some((key) => key.startsWith('checks:')), false);
+});
+
+test('App default checks payload is pinned to the pre-option success event', async () => {
+  const r = rig({ getCheckRuns: async (_repo, sha) => ({ sha, conclusion: 'success', total: 1, failed: [] }) });
+  r.api.seedPullRequest({ number: 58, head: { ref: 'branch', sha: 'sha-default' }, updatedAt: '2026-10-13T12:00:00Z' });
+  const result = await r.poller.pollOnce();
+  assert.deepEqual(result.delivered.filter((e) => e.kind === 'checks.completed'), [{
+    id: 'poll:checks:sha-default:success:0:da39a3ee5e6b', receivedAt: '2026-10-14T00:00:00.000Z',
+    repo: { owner: 'anima-research', name: 'rayforce' }, kind: 'checks.completed',
+    thread: { repo: { owner: 'anima-research', name: 'rayforce' }, number: 58, kind: 'pull' },
+    actor: { login: 'github', isBot: true }, html_url: 'https://github.com/anima-research/rayforce/pull/58',
+    sha: 'sha-default', checks: { conclusion: 'success', failed: [] },
+    raw: { sha: 'sha-default', conclusion: 'success', total: 1, failed: [] },
+  }]);
+});

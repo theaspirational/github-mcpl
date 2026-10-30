@@ -883,7 +883,7 @@ for (const kind of ['check_suite', 'check_run']) {
         await r.deliver(kind, JSON.stringify(payload));
         await r.listener.whenIdle();
       }
-      assert.deepEqual(r.events.map((e) => e.checks?.conclusion), ['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale']);
+      assert.deepEqual(r.events.map((e) => e.checks?.conclusion), ['failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure']);
       await r.deliver('issues', fixture('issues.opened.json'));
       await r.listener.whenIdle();
       assert.equal(r.events.at(-1)?.kind, 'issue.opened');
@@ -931,7 +931,7 @@ test('failure-only poll and webhook share suppressed marks, then deliver a faili
   };
   assert.equal((await pass()).length, 0);
   assert.equal(gate.committedMark(TEST_REPO, pull.head.sha)?.rank, 0);
-  assert.ok(state.snapshot().pollKeys.some((key) => key.startsWith(`checks:${pull.head.sha}:success:`)));
+  // If the webhook won the gate, the poller's covered path need not persist a key.
   api.seedCheckRuns(TEST_REPO, summarizeChecks(pull.head.sha, checkRuns(['failure'])));
   api.seedPullRequest({ number: 58, head: pull.head, updatedAt: '2026-10-14T01:00:00Z' });
   assert.deepEqual((await pass()).map((e) => e.checks?.conclusion), ['failure']);
@@ -953,4 +953,46 @@ test('webhook config factory wires failure-only policy into the signed HTTP path
   assert.equal(response.status, 202);
   await listener.whenIdle();
   assert.equal(events.length, 0);
+});
+
+for (const checksEmit of ['all', 'failures'] as const) {
+  for (const passing of ['stale', 'success'] as const) {
+    test(`webhook ${checksEmit}: ${passing} plus pending emits nothing until the real failure`, async (t) => {
+      for (const kind of ['check_suite', 'check_run']) {
+        let finished = false;
+        const gate = new CheckGate();
+        const r = await rig(t, { checksEmit, checkGate: gate, getCheckRuns: async (_repo, sha) => summarizeChecks(sha, [
+          ...checkRuns([passing]),
+          { name: 'running-job', status: finished ? 'completed' : 'in_progress', conclusion: finished ? 'failure' : null, html_url: 'https://ci/running' },
+        ], { checksEmit }) });
+        for (let pass = 0; pass < 2; pass++) {
+          await r.deliver(kind, fixture(`${kind}.completed.json`));
+          await r.listener.whenIdle();
+          assert.equal(r.events.length, 0);
+          assert.equal(gate.committedMark(TEST_REPO, HEAD), undefined);
+        }
+        finished = true;
+        await r.deliver(kind, fixture(`${kind}.completed.json`));
+        await r.listener.whenIdle();
+        assert.deepEqual(r.events.map((e) => e.checks), [{ conclusion: 'failure', failed: [{ name: 'running-job', url: 'https://ci/running' }] }]);
+      }
+    });
+  }
+}
+
+test('webhook default payload is pinned to pre-option startup_failure normalization', async (t) => {
+  const r = await rig(t);
+  await r.deliver('check_suite', JSON.stringify({
+    action: 'completed', repository: { owner: { login: 'anima-research' }, name: 'rayforce' },
+    check_suite: { head_sha: 'sha-default', conclusion: 'startup_failure' },
+  }), 'literal-default');
+  await r.listener.whenIdle();
+  assert.deepEqual(r.events, [{
+    id: 'literal-default', receivedAt: '2026-10-14T00:00:00.000Z',
+    repo: { owner: 'anima-research', name: 'rayforce' }, kind: 'checks.completed', thread: undefined,
+    actor: { login: 'github', isBot: true }, html_url: 'https://github.com/anima-research/rayforce/commit/sha-default',
+    sha: 'sha-default', checks: { conclusion: null, failed: [] },
+    raw: { action: 'completed', repository: { owner: { login: 'anima-research' }, name: 'rayforce' },
+      check_suite: { head_sha: 'sha-default', conclusion: 'startup_failure' } },
+  }]);
 });

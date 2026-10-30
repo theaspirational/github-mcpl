@@ -693,8 +693,8 @@ export class Poller {
       // Commit suppression through the same serialized gate as delivery.
       if (emit) await this.onEvent(event);
     });
-    if (!emit) return 'suppressed';
-    return delivered ? 'delivered' : 'covered';
+    if (!delivered) return 'covered';
+    return emit ? 'delivered' : 'suppressed';
   }
 
   /** Keep a head that reported nothing, until it has used up its attempts. */

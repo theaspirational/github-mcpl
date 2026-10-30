@@ -615,7 +615,7 @@ function hasNextPage(link: string | undefined): boolean {
 
 /**
  * Legacy failure set, kept unchanged for default/all output parity. The
- * opt-in policy also counts startup_failure and stale as failures, using
+ * opt-in policy also counts startup_failure as a failure, using
  * CHECK_FAILURE_CONCLUSIONS. A known failure wins even with unfinished runs.
  */
 const FAILING_CONCLUSIONS: readonly CheckConclusion[] = [
@@ -2613,7 +2613,8 @@ function numberOrNull(value: string | undefined): number | null {
  * when the read was paginated. `truncated` says rows were left unread, and a
  * truncated summary never claims `success` — it cannot know what is on the
  * page it did not fetch. `checksEmit: failures` opts into the expanded failure
- * set; omitted/all deliberately retains legacy stale/startup_failure handling.
+ * set; omitted/all deliberately retains legacy startup_failure handling.
+ * Stale runs are passing in both modes and cannot decide an unfinished head.
  */
 export function summarizeChecks(
   sha: string,

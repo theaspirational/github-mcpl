@@ -148,7 +148,7 @@ export type ChecksEmit = 'all' | 'failures';
 
 /** Worst first, for the opt-in summary. Legacy summaries keep their old set. */
 export const CHECK_FAILURE_CONCLUSIONS: readonly CheckConclusion[] = [
-  'startup_failure', 'failure', 'timed_out', 'cancelled', 'action_required', 'stale',
+  'startup_failure', 'failure', 'timed_out', 'cancelled', 'action_required',
 ];
 
 /**

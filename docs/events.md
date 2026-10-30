@@ -83,16 +83,37 @@ it, so a rule written on either fires on a merge.
 
 ### `checks.completed`
 
-| `checks.conclusion` | tag | `metadata.isCiFailure` |
-|---|---|---|
-| `success`, with an empty `failed` list | `github:ci=success` | `false` |
-| `failure`, `timed_out`, `action_required` | `github:ci=failure` | `true` |
-| anything, with a non-empty `failed` list | `github:ci=failure` | `true` |
-| `neutral`, `cancelled`, `skipped`, `stale` | *(none)* | `false` |
-| `null` (still running) | *(none)* | `false` |
+The non-empty `failed` list takes precedence over conclusion-only rows:
 
-A suite that was cancelled or skipped is neither a pass nor a failure, and is
-left untagged rather than reported as either.
+| `checks.conclusion` / failed list | tag | `metadata.isCiFailure` |
+|---|---|---|
+| anything, with a non-empty `failed` list (including `cancelled` or `startup_failure`) | `github:ci=failure` | `true` |
+| `failure`, `timed_out`, `action_required`, even with an empty `failed` list | `github:ci=failure` | `true` |
+| `success`, with an empty `failed` list | `github:ci=success` | `false` |
+| `neutral`, `cancelled`, `skipped`, `stale`, `startup_failure`, with an empty `failed` list | *(none)* | `false` |
+| `null`, with an empty `failed` list | *(none)* | `false` |
+
+`GITHUB_CHECKS_EMIT=all` (the default) preserves the existing event stream.
+Resolved check-run summaries count `failure`, `timed_out`, `cancelled` and
+`action_required` as failures, so a cancelled run already contributes to the
+`failed` list and receives the failure tag. An unresolved cancelled suite with
+an empty list does not. `startup_failure` retains its legacy all-mode handling
+(all-clear in summaries, unknown/null in webhook payload normalization).
+
+`GITHUB_CHECKS_EMIT=failures` emits only `failure`, `cancelled`, `timed_out`,
+`action_required` and `startup_failure` conclusions. It adds `startup_failure`
+to the summary failure set. A failing run wins in mixed suites; pending runs
+without a known failure keep the summary undecided. Success, neutral, skipped
+and stale results are suppressed. Stale runs remain passing in both modes,
+never appear in a resolved summary's failed list, and cannot decide a head
+whose other runs are pending.
+
+The filter does not change tagging. Resolved cancelled/startup-failure runs
+have failed-job entries, as do failure-only `check_run` payload fallbacks.
+A failure-only `check_suite` fallback for cancelled/startup_failure can have
+an empty list and therefore emit without a failure tag. Null/unknown fallback
+conclusions are suppressed in failures mode. See [checks emission](../README.md#checks-emission)
+for summary lookup fallbacks and dedup behavior.
 
 ## 3. Tags that do not depend on the kind
 

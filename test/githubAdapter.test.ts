@@ -3280,7 +3280,7 @@ for (const scenario of checksCases) {
       if (mode === 'failures') {
         assert.equal(summary.conclusion !== 'success', scenario.emits);
         assert.deepEqual(summary.failed.map((f) => f.name), scenario.conclusions.flatMap((c, i) =>
-          ['success', 'neutral', 'skipped'].includes(c) ? [] : [`job-${i}`]));
+          ['success', 'neutral', 'skipped', 'stale'].includes(c) ? [] : [`job-${i}`]));
       } else if (['stale', 'startup_failure'].includes(scenario.name)) {
         assert.equal(summary.conclusion, 'success', 'preserve even legacy summary edge cases by default');
         assert.deepEqual(summary.failed, []);
@@ -3296,10 +3296,36 @@ test('failure-only summary: pending and truncated green stay undecided; known fa
   assert.equal(summarizeChecks('s', [pending, ...checkRuns(['success'])], options).conclusion, null);
   assert.equal(summarizeChecks('s', checkRuns(['success']), { ...options, truncated: true }).conclusion, null);
   assert.equal(summarizeChecks('s', [], options).conclusion, null);
-  for (const c of ['stale', 'startup_failure', 'failure'] as const) {
+  for (const c of ['startup_failure', 'failure'] as const) {
     const result = summarizeChecks('s', [pending, ...checkRuns([c])], options);
     assert.equal(result.conclusion, c);
     assert.equal(result.unfinished, true);
   }
   assert.equal(summarizeChecks('s', checkRuns(['failure', 'stale', 'startup_failure']), options).conclusion, 'startup_failure');
 });
+
+for (const pending of [false, true]) {
+  test(`failure-only read tools keep stale passing${pending ? ' and a pending head undecided' : ''}`, async () => {
+    const r = await rig({ env: { GITHUB_CHECKS_EMIT: 'failures' } });
+    r.fake.on(`GET /repos/anima-research/rayforce/commits/${HEAD_SHA}/check-runs`, {
+      body: { total_count: 2, check_runs: [
+        ...checkRuns(['stale']),
+        { name: 'other-job', status: pending ? 'in_progress' : 'completed', conclusion: pending ? null : 'success' },
+      ] },
+    });
+    const expected = { sha: HEAD_SHA, conclusion: pending ? null : 'success', total: 2, failed: [], ...(pending ? { unfinished: true } : {}) };
+    assert.deepEqual(await r.adapter.getCheckRuns(REPO, HEAD_SHA), expected);
+    assert.deepEqual((await r.adapter.getPullRequest(PULL)).checksSummary, expected);
+    const ctx = layerContext(r.adapter, config({ GITHUB_CHECKS_EMIT: 'failures' }));
+    const checks = await readToolModule.call('get_check_runs', { sha: HEAD_SHA }, ctx);
+    assert.notEqual(checks.isError, true);
+    const pull = await readToolModule.call('get_pull_request', { number: PULL.number }, ctx);
+    assert.notEqual(pull.isError, true);
+    for (const output of [checks, pull]) {
+      const text = layerText(output);
+      assert.match(text, /0 failed/);
+      assert.doesNotMatch(text, /stale|job-0/);
+      assert.match(text, pending ? /pending/ : /success/);
+    }
+  });
+}
