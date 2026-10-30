@@ -2905,16 +2905,14 @@ test('repoSpellingProblems names an entry GitHub spells otherwise, and one the t
     fake.on('GET /repos/someone/gone', { status: 404, body: { message: 'Not Found' } });
     fake.on('GET /repos/someone/busy', { status: 502, body: { message: 'Bad gateway' } });
   });
-  const problems = await r.adapter.repoSpellingProblems([
-    { owner: 'anima-research', name: 'rayforce' },
-    { owner: 'the-glassy', name: 'github-mcpl' },
-    { owner: 'someone', name: 'gone' },
-    { owner: 'someone', name: 'busy' },
-  ]);
-  assert.deepEqual(problems, [
+  assert.deepEqual(await r.adapter.repoSpellingProblems([{ owner: 'anima-research', name: 'rayforce' }]), []);
+  assert.deepEqual(await r.adapter.repoSpellingProblems([{ owner: 'the-glassy', name: 'github-mcpl' }]), [
     'GITHUB_REPOS names "the-glassy/github-mcpl", but GitHub spells it "The-Glassy/github-mcpl": set it to "The-Glassy/github-mcpl", spelled exactly so',
+  ]);
+  assert.deepEqual(await r.adapter.repoSpellingProblems([{ owner: 'someone', name: 'gone' }]), [
     'GITHUB_REPOS names "someone/gone", which the token in GITHUB_TOKEN_FILE can\'t see (GitHub answered 404: Not Found)',
   ]);
+  assert.deepEqual(await r.adapter.repoSpellingProblems([{ owner: 'someone', name: 'busy' }]), []);
   assert.ok(r.logs.some((line) => line.includes('unchecked against GitHub') && line.includes('someone/busy')));
 });
 

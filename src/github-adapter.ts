@@ -117,6 +117,9 @@ const RATE_LIMIT_WARN_REMAINING = 20;
  * closest to expiry go first and the adapter says so on stderr.
  */
 const SECRET_RETENTION_MAX = 256;
+/** Startup repository reads: bounded to avoid a burst against GitHub. */
+const REPO_CHECK_CONCURRENCY = 8;
+
 /** Check runs read per page for one sha. GitHub's own page cap is 100. */
 const CHECK_RUN_PAGE = 100;
 /**
@@ -2172,8 +2175,9 @@ export class GitHubAdapter implements GitHubApi {
   }
 
   /**
-   * Contributor mode: what's wrong with GITHUB_REPOS's spelling, one line per
-   * entry. Notifications name a repository as GitHub spells it, and the
+   * Contributor mode: the first problem with GITHUB_REPOS, in list order.
+   * Checks run with bounded concurrency and stop on a lasting failure.
+   * Notifications name a repository as GitHub spells it, and the
    * allow-list compares exactly, so an entry spelled otherwise ("the-glassy/x"
    * for "The-Glassy/x") would drop that repository's notifications silently
    * and refuse its events' tool calls. An entry the token can't see is a
@@ -2181,31 +2185,58 @@ export class GitHubAdapter implements GitHubApi {
    * error, a rate limit) is left unchecked, with a warning.
    */
   async repoSpellingProblems(repos: readonly RepoRef[]): Promise<string[]> {
-    const problems: string[] = [];
-    for (const repo of repos) {
-      const slug = repoSlug(repo);
-      let fullName: string;
-      try {
-        fullName = await this.call('getRepository', async () => {
-          const res = await this.octokit.request('GET /repos/{owner}/{repo}', { owner: repo.owner, repo: repo.name });
-          return String((res.data as { full_name?: unknown }).full_name ?? '');
-        });
-      } catch (err) {
-        if (isLastingFailure(err)) {
-          problems.push(`GITHUB_REPOS names "${slug}", which the token in GITHUB_TOKEN_FILE can't see (${describeFailure(err)})`);
-        } else {
-          this.log('warn', 'GET /repos failed, so a GITHUB_REPOS entry is unchecked against GitHub\'s spelling', {
-            repo: slug,
-            error: err instanceof Error ? err.message : String(err),
+    let next = 0;
+    let firstFailure = repos.length;
+    let problem: string | null = null;
+    const inFlight = new Map<number, AbortController>();
+    const fail = (index: number, message: string) => {
+      if (index >= firstFailure) return;
+      firstFailure = index;
+      problem = message;
+      // Earlier entries must finish to select the first failure in list order.
+      // No later entry can change that verdict, so cancel it immediately.
+      for (const [pending, controller] of inFlight) {
+        if (pending > index) controller.abort();
+      }
+    };
+    const worker = async () => {
+      while (next < firstFailure) {
+        const index = next++;
+        const repo = repos[index];
+        const slug = repoSlug(repo);
+        const controller = new AbortController();
+        inFlight.set(index, controller);
+        try {
+          const fullName = await this.call('getRepository', async () => {
+            // Also stop a rate-limit retry if this entry was cancelled during backoff.
+            controller.signal.throwIfAborted();
+            const res = await this.octokit.request('GET /repos/{owner}/{repo}', {
+              owner: repo.owner,
+              repo: repo.name,
+              request: { signal: controller.signal },
+            });
+            return String((res.data as { full_name?: unknown }).full_name ?? '');
           });
+          if (fullName !== '' && fullName !== slug) {
+            fail(index, `GITHUB_REPOS names "${slug}", but GitHub spells it "${fullName}": set it to "${fullName}", spelled exactly so`);
+          }
+        } catch (err) {
+          if (controller.signal.aborted) continue;
+          if (isLastingFailure(err)) {
+            fail(index, `GITHUB_REPOS names "${slug}", which the token in GITHUB_TOKEN_FILE can't see (${describeFailure(err)})`);
+          } else {
+            this.log('warn', 'GET /repos failed, so a GITHUB_REPOS entry is unchecked against GitHub\'s spelling', {
+              repo: slug,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        } finally {
+          inFlight.delete(index);
         }
-        continue;
       }
-      if (fullName !== '' && fullName !== slug) {
-        problems.push(`GITHUB_REPOS names "${slug}", but GitHub spells it "${fullName}": set it to "${fullName}", spelled exactly so`);
-      }
-    }
-    return problems;
+    };
+    await Promise.all(Array.from({ length: Math.min(REPO_CHECK_CONCURRENCY, repos.length) }, worker));
+    return problem === null ? [] : [problem];
   }
 
   /**
