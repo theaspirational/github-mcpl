@@ -1772,6 +1772,46 @@ test('unavailable contributor repository holds retries without spending attempts
   assert.equal(r.state.notificationRetries().length, 0);
 });
 
+for (const healthyFirst of [false, true]) {
+  test(`unavailable retry survives reload and recovers on 304: ${healthyFirst ? 'healthy before unavailable' : 'single unavailable'}`, async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), 'gh-notif-unavailable-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const stateFile = join(dir, 'state.json');
+    const repos = [REPO, ELSEWHERE];
+    const r = rig({ stateFile, repos, repoAvailable: (repo) => repo.owner !== REPO.owner });
+    const sibling = { ...ISSUE, repo: ELSEWHERE };
+    for (const thread of healthyFirst ? [sibling, ISSUE] : [ISSUE]) {
+      r.github.threads.set(channelId(thread), threadRow(thread));
+      r.github.comments.set(channelId(thread), [comment(thread === ISSUE ? 101 : 102, 7, '2026-10-15T00:09:30Z')]);
+      r.github.notify(thread, '2026-10-15T00:09:30Z');
+    }
+    await r.poller.pollOnce();
+    assert.ok(!r.github.calls.includes(`thread ${channelId(ISSUE)}`));
+    assert.equal(r.events.some((event) => event.comment?.id === 102), healthyFirst);
+
+    const state = GithubState.load(stateFile);
+    assert.equal(state.notificationsWatermark().lastModified, r.github.lastModified);
+    assert.notEqual(state.notificationsWatermark().since, FIRST_W);
+    const [held] = state.notificationRetries();
+    assert.equal(state.notificationRetries().length, 1);
+    assert.equal(held.owner, REPO.owner);
+    assert.equal(held.attempts, 0);
+    assert.ok(held.cursor);
+    assert.ok(!held.stopped);
+
+    const recovered = rig({ state, repos, github: r.github, repoAvailable: () => true });
+    const result = await recovered.poller.pollOnce();
+    assert.equal(result.notModified, true);
+    // A held cursor resumes with the usual one-second overlap.
+    assert.ok(r.github.calls.includes(`comments ${channelId(ISSUE)} since=2026-10-15T00:03:59Z`));
+    assert.equal(recovered.events.filter((event) => event.comment?.id === 101).length, 1);
+    assert.deepEqual(GithubState.load(stateFile).notificationRetries(), []);
+    assert.equal((await recovered.poller.pollOnce()).notModified, true);
+    assert.equal(r.github.calls.filter((call) => call === `thread ${channelId(ISSUE)}`).length, 1);
+    assert.equal(recovered.events.filter((event) => event.comment?.id === 101).length, 1);
+  });
+}
+
 test('own-PR checks search only available contributor repositories', async () => {
   const r = rig({ repos: [REPO, ELSEWHERE], login: 'bot', repoAvailable: (repo) => repo === ELSEWHERE });
   let searched: readonly RepoRef[] = [];

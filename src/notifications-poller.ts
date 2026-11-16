@@ -683,6 +683,8 @@ export class NotificationsPoller {
     // A failed handoff keeps its thread cursor in the retry entry, not the
     // global window or conditional header. Only truncation holds this window:
     // a 304 cannot complete an omitted tail or move its reach-back anchor.
+    // Include deferred unavailable threads before advancing the inbox window.
+    this.state.setNotificationRetries([...retries.values()]);
     this.state.setNotificationsWatermark(page.truncated ? {
       since,
       lastModified: null,
