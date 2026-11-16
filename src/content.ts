@@ -70,7 +70,7 @@ function line(path: string, lineNo: number | null | undefined): string {
 
 export function renderEvent(event: NormalizedEvent): ContentBlock[] {
   const lines: string[] = [
-    `${ref(event.repo, event.thread?.number)} ${event.kind} by ${actor(event.actor)} — ${event.html_url}`,
+    `${event.installation ? 'GitHub connector' : ref(event.repo, event.thread?.number)} ${event.kind} by ${actor(event.actor)} — ${event.html_url}`,
   ];
 
   if (event.title !== undefined) lines.push(`title: ${title(event.title)}`);

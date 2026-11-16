@@ -179,6 +179,26 @@ const TAG_TABLE: Row[] = [
     tags: ['chat:from-bot', 'chat:ambient', 'github:ci=failure'],
   },
   {
+    kind: 'installation.unavailable',
+    tags: ['chat:from-human', 'chat:ambient', 'github:installation=unavailable'],
+  },
+  {
+    kind: 'installation.available',
+    tags: ['chat:from-human', 'chat:ambient', 'github:installation=available'],
+  },
+  {
+    kind: 'repo.unavailable',
+    tags: ['chat:from-human', 'chat:ambient', 'github:repo=unavailable'],
+  },
+  {
+    kind: 'repo.available',
+    tags: ['chat:from-human', 'chat:ambient', 'github:repo=available'],
+  },
+  {
+    kind: 'repo.renamed',
+    tags: ['chat:from-human', 'chat:ambient', 'github:repo=renamed'],
+  },
+  {
     kind: 'push',
     event: { sha: 'd'.repeat(40) },
     tags: ['chat:from-human', 'chat:ambient', 'github:push'],

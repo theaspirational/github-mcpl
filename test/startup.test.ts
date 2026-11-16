@@ -7,6 +7,7 @@ import { test, type TestContext } from 'node:test';
 import { setImmediate } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { GitHubAdapter } from '../src/github-adapter.js';
+import { RepoAvailability } from '../src/repo-availability.js';
 import { readConfig, silentLogger } from '../src/types.js';
 
 const repos = Array.from({ length: 114 }, (_, i) => ({ owner: 'owner', name: `repo${i}` }));
@@ -37,15 +38,15 @@ function rig(t: TestContext, sleep?: (ms: number) => Promise<void>) {
     fetch: async (input, init) => {
       const index = Number(new URL(String(input)).pathname.match(/repo(\d+)$/)![1]);
       const signal = init!.signal!;
-      signal.throwIfAborted();
+      signal?.throwIfAborted();
       started.push(index);
       peak = Math.max(peak, ++active);
       try {
         return await new Promise<Response>((resolve, reject) => {
           const abort = () => { aborted.push(index); reject(signal.reason); };
-          signal.addEventListener('abort', abort, { once: true });
+          signal?.addEventListener('abort', abort, { once: true });
           pending.set(index, {
-            answer: (response) => { signal.removeEventListener('abort', abort); resolve(response); },
+            answer: (response) => { signal?.removeEventListener('abort', abort); resolve(response); },
             signal,
           });
         });
@@ -55,7 +56,9 @@ function rig(t: TestContext, sleep?: (ms: number) => Promise<void>) {
       }
     },
   });
-  return { adapter, pending, started, aborted, warnings, peak: () => peak };
+  const events: import('../src/types.js').NormalizedEvent[] = [];
+  const availability = new RepoAvailability(repos, (repo) => adapter.getRepositoryName(repo), async (event) => { events.push(event); });
+  return { adapter, availability, events, pending, started, aborted, warnings, peak: () => peak };
 }
 
 function success(index: number): Response {
@@ -65,7 +68,8 @@ function success(index: number): Response {
 for (const count of [0, 3, 114]) {
   test(`repository verification bounds concurrency at eight for ${count} entries`, { timeout: 5000 }, async (t) => {
     const r = rig(t);
-    const result = r.adapter.repoSpellingProblems(repos.slice(0, count));
+    const availability = new RepoAvailability(repos.slice(0, count), (repo) => r.adapter.getRepositoryName(repo), async () => {});
+    const result = availability.initialize();
     await setImmediate();
     assert.equal(r.pending.size, Math.min(count, 8));
     while (r.pending.size) {
@@ -73,66 +77,61 @@ for (const count of [0, 3, 114]) {
       for (const [index, request] of r.pending) request.answer(success(index));
       await setImmediate();
     }
-    assert.deepEqual(await result, []);
+    await result;
+    assert.ok(repos.slice(0, count).every((repo) => availability.available(repo)));
     assert.deepEqual(r.started, Array.from({ length: count }, (_, i) => i));
     assert.equal(r.peak(), Math.min(count, 8));
     assert.deepEqual(r.aborted, []);
   });
 }
 
-for (const failure of ['404', 'mismatch'] as const) {
-  for (const earlierFails of [false, true]) {
-    test(`${failure}: stop later checks, await earlier checks, report first failure (earlier fails: ${earlierFails})`, { timeout: 5000 }, async (t) => {
-      const r = rig(t);
-      let settled = false;
-      const result = r.adapter.repoSpellingProblems(repos).then((problems) => { settled = true; return problems; });
-      await setImmediate();
-      const fail = (index: number) => r.pending.get(index)!.answer(failure === '404'
-        ? Response.json({ message: 'Not Found' }, { status: 404 })
-        : Response.json({ full_name: `Owner/repo${index}` }));
-      fail(4);
-      await setImmediate();
-      assert.deepEqual(r.aborted, [5, 6, 7]);
-      assert.equal(settled, false, 'must not return before earlier entries settle');
-      if (earlierFails) {
-        fail(1);
-        await setImmediate();
-        assert.deepEqual(r.aborted, [5, 6, 7, 2, 3]);
-      }
-      for (const [index, request] of r.pending) request.answer(success(index));
-      const index = earlierFails ? 1 : 4;
-      assert.deepEqual(await result, [failure === '404'
-        ? `GITHUB_REPOS names "owner/repo${index}", which the token in GITHUB_TOKEN_FILE can't see (GitHub answered 404: Not Found)`
-        : `GITHUB_REPOS names "owner/repo${index}", but GitHub spells it "Owner/repo${index}": set it to "Owner/repo${index}", spelled exactly so`]);
-      assert.deepEqual(r.started, [0, 1, 2, 3, 4, 5, 6, 7], 'no new checks after a fatal result');
-      assert.equal(r.pending.size, 0);
-      assert.deepEqual(r.warnings, [], 'cancelled checks must not produce transient-failure warnings');
-    });
+test('a missing entry never cancels siblings; rename stays available and all 114 probes finish', { timeout: 5000 }, async (t) => {
+  const r = rig(t);
+  const result = r.availability.initialize();
+  await setImmediate();
+  r.pending.get(4)!.answer(Response.json({ message: 'Not Found' }, { status: 404 }));
+  r.pending.get(1)!.answer(Response.json({ full_name: 'new-owner/renamed' }));
+  await setImmediate();
+  while (r.pending.size) {
+    for (const [index, request] of r.pending) request.answer(success(index));
+    await setImmediate();
   }
-}
+  await result;
+  assert.equal(r.peak(), 8);
+  assert.equal(r.started.length, 114);
+  assert.deepEqual(r.aborted, []);
+  assert.equal(r.availability.available(repos[4]), false);
+  assert.ok(repos.filter((_, i) => i !== 4).every((repo) => r.availability.available(repo)));
+  assert.deepEqual(r.events.map((event) => [event.kind, event.repo.name]).sort(), [
+    ['repo.renamed', 'repo1'], ['repo.unavailable', 'repo4'],
+  ]);
+});
 
-test('a later check in rate-limit backoff does not retry after a fatal failure', { timeout: 5000 }, async (t) => {
+test('a sibling failure does not cancel a rate-limited probe retry', { timeout: 5000 }, async (t) => {
   let resume!: () => void;
   const delays: number[] = [];
-  const r = rig(t, (ms) => {
-    delays.push(ms);
-    return new Promise<void>((resolve) => { resume = resolve; });
-  });
-  const result = r.adapter.repoSpellingProblems(repos);
+  const r = rig(t, (ms) => { delays.push(ms); return new Promise<void>((resolve) => { resume = resolve; }); });
+  const result = r.availability.initialize();
   await setImmediate();
   r.pending.get(7)!.answer(Response.json({ message: 'secondary rate limit' }, {
     status: 403, headers: { 'retry-after': '1' },
   }));
   await setImmediate();
-  assert.deepEqual(delays, [1000], 'retain the existing Retry-After backoff');
   r.pending.get(0)!.answer(Response.json({ message: 'Not Found' }, { status: 404 }));
   await setImmediate();
   resume();
-  assert.deepEqual(await result, [
-    'GITHUB_REPOS names "owner/repo0", which the token in GITHUB_TOKEN_FILE can\'t see (GitHub answered 404: Not Found)',
-  ]);
-  assert.deepEqual(r.started, [0, 1, 2, 3, 4, 5, 6, 7], 'neither queued requests nor a cancelled retry reach GitHub');
-  assert.deepEqual(r.warnings, ['github rate limited; one retry']);
+  await setImmediate();
+  while (r.pending.size) {
+    for (const [index, request] of r.pending) request.answer(success(index));
+    await setImmediate();
+  }
+  await result;
+  assert.deepEqual(delays, [1000]);
+  assert.equal(r.started.length, 115);
+  assert.equal(r.peak(), 8);
+  assert.equal(r.availability.available(repos[0]), false);
+  assert.equal(r.availability.available(repos[7]), true);
+  assert.deepEqual(r.aborted, []);
 });
 
 async function runCli(t: TestContext, failure?: string): Promise<{
@@ -145,7 +144,7 @@ async function runCli(t: TestContext, failure?: string): Promise<{
   const started = performance.now();
   const child = spawn(process.execPath, [
     '--import', 'tsx', '--import', fileURLToPath(new URL('./fixtures/startup-fetch.mjs', import.meta.url)),
-    fileURLToPath(new URL('../src/index.ts', import.meta.url)), '--stdio',
+    fileURLToPath(new URL(process.env.STARTUP_BUILT ? '../dist/src/index.js' : '../src/index.ts', import.meta.url)), '--stdio',
   ], {
     // Do not inherit any real credentials or GitHub configuration.
     env: {
@@ -192,17 +191,16 @@ test('CLI answers initialize in <10s with 114 repositories at 300ms per request'
   t.diagnostic(`Node ${process.version}: initialize ${r.initializeMs!.toFixed(1)}ms, 114 repository requests at 300ms, peak ${r.stats.peak}`);
 });
 
-for (const failure of ['404', 'mismatch']) {
-  test(`CLI fails closed on ${failure} with other checks in flight; never answers initialize`, { timeout: 5000 }, async (t) => {
+for (const failure of ['404', 'renamed', 'mixed']) {
+  test(`CLI keeps serving with ${failure} entries alongside healthy repositories`, { timeout: 15000 }, async (t) => {
     const r = await runCli(t, failure);
-    assert.equal(r.code, 1, r.stderr);
-    assert.equal(r.stdout, '');
-    assert.equal(r.initializeMs, null);
-    assert.match(r.stderr, failure === '404'
-      ? /GITHUB_REPOS names "owner\/repo1", which the token in GITHUB_TOKEN_FILE can't see \(GitHub answered 404: Not Found\)/
-      : /GITHUB_REPOS names "owner\/repo1", but GitHub spells it "Owner\/repo1"/);
-    assert.doesNotMatch(r.stderr, /GITHUB_REPOS names "owner\/repo4"|github-mcpl starting|polling notifications|unchecked/);
-    assert.deepEqual(r.stats, { started: 8, completed: 3, aborted: 5, active: 0, peak: 8 });
+    assert.equal(r.code, 0, r.stderr);
+    assert.ok(JSON.parse(r.stdout.trim()).result.capabilities.experimental.mcpl);
+    assert.ok(r.initializeMs !== null && r.initializeMs < 10000);
+    if (failure !== 'renamed') assert.match(r.stderr, /repository set aside/);
+    if (failure !== '404') assert.match(r.stderr, /repository renamed or transferred/);
+    assert.deepEqual(r.stats, { started: 114, completed: 114, aborted: 0, active: 0, peak: 8 });
+    t.diagnostic(`${process.env.STARTUP_BUILT ? 'built' : 'source'} CLI ${failure}: initialize ${r.initializeMs!.toFixed(1)}ms, peak ${r.stats.peak}`);
   });
 }
 
@@ -217,7 +215,7 @@ test('checks emission config defaults to all, accepts failures, and rejects inva
 });
 
 test('CLI refuses an invalid checks emission option before adapter startup', { timeout: 5000 }, async (t) => {
-  const child = spawn(process.execPath, ['--import', 'tsx', fileURLToPath(new URL('../src/index.ts', import.meta.url)), '--stdio'], {
+  const child = spawn(process.execPath, ['--import', 'tsx', fileURLToPath(new URL(process.env.STARTUP_BUILT ? '../dist/src/index.js' : '../src/index.ts', import.meta.url)), '--stdio'], {
     env: { PATH: process.env.PATH, GITHUB_TOKEN_FILE: tokenFile(t), GITHUB_REPOS: 'owner/repo0', GITHUB_CHECKS_EMIT: 'invalid' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });

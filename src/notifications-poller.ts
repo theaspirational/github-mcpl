@@ -163,6 +163,7 @@ export interface NotificationsPollerOptions {
   intervalMs: number;
   /** GITHUB_REPOS. A notification from any other repository is dropped. */
   repos: readonly RepoRef[];
+  repoAvailable?: (repo: RepoRef) => boolean;
   /** The token's login: whose open pull requests have their checks looked up. Without it, none are. */
   login?: string;
   onEvent: EventListener;
@@ -375,6 +376,7 @@ export class NotificationsPoller {
   private readonly api: NotificationsPollerApi;
   private readonly state: NotificationsIngressState;
   private readonly configuredIntervalMs: number;
+  private readonly repoAvailable: (repo: RepoRef) => boolean;
   private readonly repos: readonly RepoRef[];
   private readonly login: string;
   private readonly onEvent: EventListener;
@@ -403,6 +405,7 @@ export class NotificationsPoller {
     this.state = opts.state;
     this.configuredIntervalMs = opts.intervalMs;
     this.repos = opts.repos;
+    this.repoAvailable = opts.repoAvailable ?? (() => true);
     this.login = opts.login ?? '';
     this.onEvent = opts.onEvent;
     this.canPoll = opts.canPoll ?? (() => true);
@@ -595,6 +598,11 @@ export class NotificationsPoller {
       const waiting = listed.get(channel) ?? retries.get(channel);
       const attemptsSoFar = waiting?.attempts ?? 0;
       const request = requests.get(channel);
+      if (!this.repoAvailable(thread.repo)) {
+        // Hold the cursor and retry without spending a thread's failure budget.
+        retries.set(channel, retryEntry(thread, attemptsSoFar, this.holdPlace(thread, reachFrom, waiting?.cursor ?? null), request, waiting));
+        continue;
+      }
       if (rateLimited > 0) {
         // GitHub's rate limit ended this pass's reads: the rest wait for the next, uncounted.
         retries.set(channel, retryEntry(thread, attemptsSoFar, this.holdPlace(thread, reachFrom, waiting?.cursor ?? null), request, waiting));
@@ -841,7 +849,7 @@ export class NotificationsPoller {
     if (!this.login) return out;
     let pulls: OwnPull[];
     try {
-      pulls = await this.api.listOwnOpenPulls(this.login, this.repos);
+      pulls = await this.api.listOwnOpenPulls(this.login, this.repos.filter(this.repoAvailable));
     } catch (err) {
       this.logger.warn('notifications: listing the token user\'s open pull requests failed; their checks are looked up next pass', {
         error: err instanceof Error ? err.message : String(err),

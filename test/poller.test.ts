@@ -360,7 +360,7 @@ test('a collection failure after a changed head does not advance the head (findi
   };
 
   const r = rig({ api, cursor: '2026-10-13T09:00:00.000Z' });
-  await assert.rejects(() => r.poller.pollOnce(), /502 on the comment page/);
+  assert.equal((await r.poller.pollOnce()).failed, 1);
   assert.equal(
     r.state.heads.get('github:anima-research/rayforce#58'),
     undefined,
@@ -810,7 +810,7 @@ test('a first pass whose read throws keeps the window it read', async () => {
     throw new Error('GitHub 502 on the issues page');
   };
   const r = rig({ api, cursor: null, now: '2026-10-14T00:00:00.700Z' });
-  await assert.rejects(() => r.poller.pollOnce(), /502 on the issues page/);
+  assert.equal((await r.poller.pollOnce()).failed, 1);
   assert.equal(r.state.lastPollAt(), '2026-10-13T23:59:00.000Z');
 });
 

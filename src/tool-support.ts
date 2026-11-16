@@ -270,14 +270,19 @@ export function resolveRepo(args: Record<string, unknown>, ctx: ToolContext): Re
   }
   const raw = optionalString(args, 'repo');
   if (raw === undefined || raw.trim() === '') {
-    if (allowed.length === 1) return allowed[0];
+    if (allowed.length === 1) {
+      ctx.assertRepoAvailable?.(allowed[0]);
+      return allowed[0];
+    }
     throw new ToolArgumentError(
       `"repo" is required: GITHUB_REPOS names several repositories (${boundedInline(allowed.map(repoSlug), FIELD.slug)})`,
     );
   }
   const repo = parseRepoSlug(raw);
   if (!repo) throw new ToolArgumentError(`"repo" must be owner/name, got ${echo(raw, FIELD.slug)}`);
-  return requireAllowedRepo(repo, allowed);
+  requireAllowedRepo(repo, allowed);
+  ctx.assertRepoAvailable?.(repo);
+  return repo;
 }
 
 /**
@@ -390,6 +395,7 @@ export function resolveThread(args: Record<string, unknown>, ctx: ToolContext, k
     const parsed = parseThread(args.thread, ctx, kind);
     if (!parsed.ok) throw new ToolArgumentError(parsed.error);
     requireAllowedRepo(parsed.value.repo, ctx.repos);
+    ctx.assertRepoAvailable?.(parsed.value.repo);
     return { ...parsed.value, kind };
   }
   return { repo: resolveRepo(args, ctx), number: requireNumber(args, 'number'), kind };

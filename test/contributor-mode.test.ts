@@ -362,6 +362,8 @@ test('contributor merge and Actions traverse host grants, server tools/call and 
       const route = `${req.method} ${new URL(req.url).pathname}`;
       const json = (body: unknown) => new Response(JSON.stringify(body), { headers: { 'content-type': 'application/json' } });
       switch (route) {
+        case 'GET /repos/mine/fork':
+          return json({ full_name: 'mine/fork', default_branch: 'main' });
         case 'GET /repos/mine/fork/pulls/12':
           return json({ number: 12, state: 'open', draft: false, merged: false,
             head: { ref: 'feature', sha: head, repo: { owner: { login: 'mine' }, name: 'fork' } },

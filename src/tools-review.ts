@@ -132,8 +132,9 @@ export function requireReviewThreadId(args: Record<string, unknown>): string {
  * *its* threads: the repository allow-list is checked on the pull request
  * (`resolveThread`), and membership on the list GitHub returns for it.
  *
- * The cost is one extra read per resolve, which is the price of the id being
- * unforgeable here.
+ * Keep that pull context on the mutation too: the adapter revalidates the
+ * node's actual repository and pull immediately before the bare-ID mutation.
+ * GitHub provides no atomic name condition on the mutation itself.
  */
 async function requireThreadOnPull(
   args: Record<string, unknown>,
@@ -276,14 +277,14 @@ async function callReview(name: string, args: Record<string, unknown>, ctx: Tool
     }
     case TOOL_RESOLVE_THREAD: {
       const { pull, threadId } = await requireThreadOnPull(args, ctx);
-      await ctx.api.resolveReviewThread(threadId);
+      await ctx.api.resolveReviewThread(pull, threadId);
       return toolResult(
         `resolved review thread ${field(threadId, FIELD.nodeId)} on ${repoSlug(pull.repo)}#${pull.number}`,
       );
     }
     case TOOL_UNRESOLVE_THREAD: {
       const { pull, threadId } = await requireThreadOnPull(args, ctx);
-      await ctx.api.unresolveReviewThread(threadId);
+      await ctx.api.unresolveReviewThread(pull, threadId);
       return toolResult(
         `unresolved review thread ${field(threadId, FIELD.nodeId)} on ${repoSlug(pull.repo)}#${pull.number}`,
       );

@@ -173,7 +173,7 @@ interface Rig {
   setNow(at: string): void;
 }
 
-function rig(options: { checksEmit?: 'all' | 'failures'; stateFile?: string | null; state?: GithubState; github?: FakeGitHub; repos?: RepoRef[]; login?: string } = {}): Rig {
+function rig(options: { repoAvailable?: (repo: RepoRef) => boolean; checksEmit?: 'all' | 'failures'; stateFile?: string | null; state?: GithubState; github?: FakeGitHub; repos?: RepoRef[]; login?: string } = {}): Rig {
   const github = options.github ?? new FakeGitHub();
   const state = options.state ?? GithubState.load(options.stateFile ?? null);
   const events: NormalizedEvent[] = [];
@@ -186,6 +186,7 @@ function rig(options: { checksEmit?: 'all' | 'failures'; stateFile?: string | nu
   const poller = new NotificationsPoller({
     api: github,
     checksEmit: options.checksEmit,
+    repoAvailable: options.repoAvailable,
     state,
     intervalMs: MIN_POLL_INTERVAL_MS,
     repos: options.repos ?? [REPO],
@@ -1746,4 +1747,35 @@ test('token default checks payload is pinned to the pre-option success event', a
     sha: 'sha-default', checks: { conclusion: 'success', failed: [] },
     raw: { sha: 'sha-default', conclusion: 'success', total: 1, failed: [] },
   }]);
+});
+
+test('unavailable contributor repository holds retries without spending attempts and healthy siblings continue', async () => {
+  let available = false;
+  const r = rig({ repos: [REPO, ELSEWHERE], repoAvailable: (repo) => repo.owner !== REPO.owner || available });
+  const sibling = { ...ISSUE, repo: ELSEWHERE };
+  for (const thread of [ISSUE, sibling]) {
+    r.github.threads.set(channelId(thread), threadRow(thread));
+    r.github.comments.set(channelId(thread), [comment(thread === ISSUE ? 101 : 102, 7, '2026-10-15T00:09:30Z')]);
+    r.github.notify(thread, '2026-10-15T00:09:30Z');
+  }
+  for (let i = 0; i < 7; i++) await r.poller.pollOnce();
+  assert.ok(!r.github.calls.includes(`thread ${channelId(ISSUE)}`));
+  assert.ok(r.github.calls.includes(`thread ${channelId(sibling)}`));
+  assert.ok(r.events.some((event) => event.repo === ELSEWHERE));
+  const held = r.state.notificationRetries().find((retry) => retry.owner === REPO.owner)!;
+  assert.equal(held.attempts, 0);
+  assert.ok(!held.stopped);
+  available = true;
+  await r.poller.pollOnce();
+  assert.ok(r.github.calls.includes(`thread ${channelId(ISSUE)}`));
+  assert.ok(r.events.some((event) => event.comment?.id === 101));
+  assert.equal(r.state.notificationRetries().length, 0);
+});
+
+test('own-PR checks search only available contributor repositories', async () => {
+  const r = rig({ repos: [REPO, ELSEWHERE], login: 'bot', repoAvailable: (repo) => repo === ELSEWHERE });
+  let searched: readonly RepoRef[] = [];
+  r.github.listOwnOpenPulls = async (_login, repos) => { searched = repos; return []; };
+  await r.poller.pollOnce();
+  assert.deepEqual(searched, [ELSEWHERE]);
 });

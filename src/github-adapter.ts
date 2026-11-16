@@ -35,6 +35,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createPrivateKey, createSign, type KeyObject } from 'node:crypto';
 import { Octokit } from 'octokit';
+import { assertRepositoryIdentity, isInstallationDenial, REPO_RETRY_MS, REPO_MAX_RETRY_MS, RepoScopeError, type InstallationDiscoveryOutcome } from './repo-availability.js';
 import {
   LIMITS,
   repoSlug,
@@ -119,8 +120,6 @@ const RATE_LIMIT_WARN_REMAINING = 20;
  * closest to expiry go first and the adapter says so on stderr.
  */
 const SECRET_RETENTION_MAX = 256;
-/** Startup repository reads: bounded to avoid a burst against GitHub. */
-const REPO_CHECK_CONCURRENCY = 8;
 
 /** Check runs read per page for one sha. GitHub's own page cap is 100. */
 const CHECK_RUN_PAGE = 100;
@@ -206,7 +205,7 @@ export function redactSecrets(text: string): string {
 /**
  * A failed GitHub call, as the rest of the package sees it.
  *
- * Carries the HTTP status and GitHub's own message and nothing else: no
+ * Carries the HTTP status, redacted message and sanitized discovery outcomes: no
  * request URL (which identifies the installation), no header, and above all no
  * token. A GraphQL answer that is HTTP 200 with an `errors` array reports
  * status 200 and the first message.
@@ -231,6 +230,8 @@ export class GitHubApiError extends Error {
      * octokit gave it, and status 0 is this adapter's own failure.
      */
     readonly answered: boolean = status > 0,
+    readonly rateLimited = false,
+    readonly installationDiscovery?: readonly InstallationDiscoveryOutcome[],
   ) {
     const safe = redactSecrets(githubMessage);
     super(status > 0 ? `GitHub ${status} on ${operation}: ${safe}` : `${operation}: ${safe}`);
@@ -260,6 +261,8 @@ export interface GitHubAdapterOptions {
   baseUrl?: string;
   /** Clock, injectable so token expiry is testable without waiting. */
   now?: () => number;
+  /** Observe the target reached through a configured entry, never an arbitrary data identity. */
+  onRepositoryResolved?: (repo: RepoRef, canonicalName: string) => Promise<void>;
   /** Backoff, injectable so the rate-limit retry is testable without waiting. */
   sleep?: (ms: number) => Promise<void>;
 }
@@ -288,6 +291,7 @@ interface ApiActor {
 }
 
 interface ApiIssue {
+  repository_url?: string;
   id?: number;
   number?: number;
   title?: string | null;
@@ -453,6 +457,7 @@ interface GqlActor {
 
 interface GqlReviewThreadsResponse {
   repository?: {
+    nameWithOwner?: string;
     pullRequest?: {
       reviewThreads?: {
         nodes?: Array<{
@@ -639,6 +644,8 @@ export class GitHubAdapter implements GitHubApi {
   /** Contributor mode only: the static token every call authenticates with. */
   private readonly userToken: string | null;
 
+  private readonly canonicalRepositories = new Map<string, RepoRef>();
+
   /**
    * JWT-authenticated: `/app`, installation discovery, token minting. Null in
    * contributor mode, which has no App identity to JWT-authenticate as.
@@ -677,7 +684,10 @@ export class GitHubAdapter implements GitHubApi {
   private readonly liveCredentials = new Set<Set<string>>();
   /** Which live set the code currently running belongs to. */
   private readonly callScope = new AsyncLocalStorage<Set<string>>();
+  private readonly onRepositoryResolved?: GitHubAdapterOptions['onRepositoryResolved'];
   private installationIdCache: number | null;
+  /** Sequential repo probes share failed discovery as well as in-flight mints. */
+  private installationDiscoveryFailure?: { error: unknown; retryAt: number; attempts: number };
   /** In flight mints are shared so a burst of calls mints one token, not ten. */
   private tokenInFlight: Promise<string> | null = null;
   private botCache: BotIdentity | null = null;
@@ -688,6 +698,7 @@ export class GitHubAdapter implements GitHubApi {
     private readonly config: Config,
     options: GitHubAdapterOptions = {},
   ) {
+    this.onRepositoryResolved = options.onRepositoryResolved;
     this.logger = options.logger ?? stderrLogger();
     this.now = options.now ?? (() => Date.now());
     this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
@@ -889,7 +900,11 @@ export class GitHubAdapter implements GitHubApi {
       // meanwhile aged out of the ring.
       this.holdCredential(credential.replace(/^(?:Bearer|token)\s+/i, ''));
       headers.set('authorization', credential);
-      const response = await this.baseFetch(input, { ...init, headers });
+      const path = new URL(String(input)).pathname;
+      const metadataRead = init?.method === 'GET' && /^\/(?:repositories\/\d+|repos\/[^/]+\/[^/]+)$/.test(path);
+      // Preserve upstream fetch redirect semantics for content and installation
+      // discovery. Metadata redirects are traversed explicitly to report the target.
+      const response = await this.baseFetch(input, { ...init, headers, ...(metadataRead ? { redirect: 'manual' as const } : {}) });
       this.recordRateLimit(response.headers);
       return response;
     };
@@ -932,40 +947,56 @@ export class GitHubAdapter implements GitHubApi {
   }
 
   /**
-   * GITHUB_APP_INSTALLATION_ID, or the installation the App has on the first
+   * GITHUB_APP_INSTALLATION_ID, or the installation the App has on a valid
    * GITHUB_REPOS entry. Every entry shares that owner (readConfig refuses a
-   * second one), and an App is installed on an owner once, so the first
-   * repository's installation is every repository's. The lookup is the
+   * second one), and an App is installed on an owner once, so one valid
+   * repository's installation serves every repository. The lookup is the
    * repository's own installation endpoint; discovering it once is enough, an
    * installation id is stable.
    */
   private async resolveInstallationId(): Promise<number> {
     if (this.installationIdCache !== null) return this.installationIdCache;
-    const repo = this.config.repos[0];
-    if (!repo) {
-      throw new GitHubApiError(
-        0,
-        'no repository in GITHUB_REPOS to discover the installation from, and GITHUB_APP_INSTALLATION_ID is unset',
-        'resolveInstallationId',
-      );
+    const previous = this.installationDiscoveryFailure;
+    if (previous && this.now() < previous.retryAt) throw previous.error;
+    // A stale first entry must not prevent discovery through a healthy sibling.
+    const outcomes: InstallationDiscoveryOutcome[] = [];
+    const failures: GitHubApiError[] = [];
+    for (const repo of this.config.repos) {
+      try {
+        const id = await this.call('resolveInstallationId', async () => {
+          const res = await (this.appOctokit as Octokit).request('GET /repos/{owner}/{repo}/installation', {
+            owner: repo.owner, repo: repo.name,
+          });
+          return (res.data as { id?: number }).id ?? 0;
+        }, { refreshAuth: false });
+        if (!id) throw new GitHubApiError(0, 'installation response carried no id', 'resolveInstallationId');
+        this.installationIdCache = id;
+        this.installationDiscoveryFailure = undefined;
+        this.log('info', 'github installation discovered', { repo: repoSlug(repo), installationId: id });
+        return id;
+      } catch (err) {
+        const failure = err instanceof GitHubApiError ? err
+          : new GitHubApiError(0, 'installation lookup failed', 'resolveInstallationId');
+        outcomes.push({ repo, status: failure.status, rateLimited: failure.rateLimited });
+        failures.push(failure);
+      }
     }
-    const id = await this.call(
-      'resolveInstallationId',
-      async () => {
-        const res = await (this.appOctokit as Octokit).request('GET /repos/{owner}/{repo}/installation', {
-          owner: repo.owner,
-          repo: repo.name,
-        });
-        return (res.data as { id?: number }).id ?? 0;
-      },
-      { refreshAuth: false },
+    // One inconclusive lookup makes the failed sweep inconclusive, regardless
+    // of sibling order. Keep every outcome, not just a representative status.
+    const representative = failures.find(failure => !isInstallationDenial(failure)) ?? failures.at(-1);
+    const error = new GitHubApiError(
+      representative?.status ?? 0,
+      representative?.githubMessage ?? 'no installation found through GITHUB_REPOS',
+      'resolveInstallationId', false, representative?.answered ?? false,
+      outcomes.some(outcome => outcome.rateLimited), outcomes,
     );
-    if (!id) {
-      throw new GitHubApiError(0, `the App has no installation on ${repoSlug(repo)}`, 'resolveInstallationId');
-    }
-    this.log('info', 'github installation discovered', { repo: repoSlug(repo), installationId: id });
-    this.installationIdCache = id;
-    return id;
+    const attempts = (previous?.attempts ?? 0) + 1;
+    this.installationDiscoveryFailure = {
+      error,
+      attempts,
+      retryAt: this.now() + Math.min(REPO_RETRY_MS * 2 ** Math.min(attempts - 1, 10), REPO_MAX_RETRY_MS),
+    };
+    throw error;
   }
 
   /** The installation token, minted on first use and re-minted before expiry. */
@@ -1028,7 +1059,7 @@ export class GitHubAdapter implements GitHubApi {
   private async call<T>(
     operation: string,
     fn: () => Promise<T>,
-    opts: { refreshAuth?: boolean } = {},
+    opts: { refreshAuth?: boolean; retry?: boolean } = {},
   ): Promise<T> {
     const live = new Set<string>();
     this.liveCredentials.add(live);
@@ -1043,7 +1074,7 @@ export class GitHubAdapter implements GitHubApi {
   private async attempt<T>(
     operation: string,
     fn: () => Promise<T>,
-    opts: { refreshAuth?: boolean } = {},
+    opts: { refreshAuth?: boolean; retry?: boolean } = {},
   ): Promise<T> {
     const refreshAuth = opts.refreshAuth !== false;
     let authRetried = false;
@@ -1053,6 +1084,7 @@ export class GitHubAdapter implements GitHubApi {
       try {
         return await fn();
       } catch (raw) {
+        if (raw instanceof RepoScopeError) throw raw;
         // Auth runs inside the transport, before the request is sent, so a
         // failure to mint a token or to find the installation surfaces here
         // wrapped in octokit's generic "the fetch threw" error. Unwrap it and
@@ -1060,7 +1092,7 @@ export class GitHubAdapter implements GitHubApi {
         // from `getIssue`, as a failure of a request that never went out.
         const authFailure = authFailureIn(raw);
         if (authFailure) {
-          throw new GitHubApiError(authFailure.status, authFailure.githubMessage, authFailure.operation);
+          throw new GitHubApiError(authFailure.status, authFailure.githubMessage, authFailure.operation, false, authFailure.answered, authFailure.rateLimited, authFailure.installationDiscovery);
         }
 
         const failure = normalizeFailure(raw);
@@ -1068,7 +1100,7 @@ export class GitHubAdapter implements GitHubApi {
         // A token that GitHub no longer accepts: mint once more, try once
         // more. Contributor mode's token cannot be re-minted — it is the one
         // static secret in GITHUB_TOKEN_FILE — so a 401 there is terminal.
-        if (failure.status === 401 && refreshAuth && !authRetried && this.config.authMode === 'app') {
+        if (failure.status === 401 && refreshAuth && opts.retry !== false && !authRetried && this.config.authMode === 'app') {
           authRetried = true;
           this.invalidateToken();
           this.log('warn', 'github rejected the installation token; re-minting', { operation });
@@ -1076,7 +1108,7 @@ export class GitHubAdapter implements GitHubApi {
         }
 
         const delay = this.retryDelay(failure);
-        if (delay !== null && !rateRetried) {
+        if (delay !== null && opts.retry !== false && !rateRetried) {
           rateRetried = true;
           this.log('warn', 'github rate limited; one retry', {
             operation,
@@ -1093,6 +1125,9 @@ export class GitHubAdapter implements GitHubApi {
           operation,
           failure.status >= 500 && !failure.read,
           failure.answered,
+          failure.status === 429 || (failure.status === 403 && (
+            failure.headers['retry-after'] !== undefined || failure.headers['x-ratelimit-remaining'] === '0' ||
+            /rate limit|abuse detection/i.test(failure.message))),
         );
       }
     }
@@ -1133,6 +1168,42 @@ export class GitHubAdapter implements GitHubApi {
   // ───────────────────────────────────────────────────────────────────────────
   // Reads
   // ───────────────────────────────────────────────────────────────────────────
+
+  /** Resolve a configured entry to its accessible canonical target, including transfers. */
+  async getRepositoryName(repo: RepoRef): Promise<string> {
+    return (await this.repositoryMetadata(repo)).full_name;
+  }
+
+  private async repositoryMetadata(repo: RepoRef): Promise<{ full_name: string; default_branch?: string }> {
+    return this.call('getRepositoryName', async () => {
+      let route = 'GET /repos/{owner}/{repo}';
+      let parameters: Record<string, string> = { owner: repo.owner, repo: repo.name };
+      for (let redirects = 0; redirects < 5; redirects++) {
+        const res = await this.octokit.request(route, parameters);
+        if (res.status >= 300 && res.status < 400) {
+          const location = res.headers.location;
+          if (!location) throw new GitHubApiError(res.status, 'redirect has no location', 'getRepositoryName');
+          const base = new URL(this.octokit.request.endpoint.DEFAULTS.baseUrl as string);
+          const target = new URL(location, base);
+          // Do not send the installation credential to an arbitrary redirect host/path.
+          if (target.origin !== base.origin || target.username || target.password ||
+              !/^\/(?:repositories\/\d+|repos\/[^/]+\/[^/]+)$/.test(target.pathname) || target.search || target.hash) {
+            throw new GitHubApiError(res.status, 'unsafe repository redirect', 'getRepositoryName');
+          }
+          route = `GET ${target.href}`;
+          parameters = {};
+          continue;
+        }
+        const name = (res.data as { full_name?: string }).full_name;
+        if (!name || !/^[^/\s]+\/[^/\s]+$/.test(name)) throw new Error('repository response has no full_name');
+        const [owner, canonical] = name.split('/');
+        this.canonicalRepositories.set(repoSlug(repo).toLowerCase(), { owner, name: canonical });
+        await this.onRepositoryResolved?.(repo, name);
+        return { ...(res.data as { default_branch?: string }), full_name: name };
+      }
+      throw new Error('too many repository redirects');
+    });
+  }
 
   async getIssue(ref: ThreadRef): Promise<Issue> {
     return this.call('getIssue', async () => {
@@ -1184,6 +1255,7 @@ export class GitHubAdapter implements GitHubApi {
   async listReviewThreads(pull: ThreadRef): Promise<ReviewThread[]> {
     const query = `query($owner:String!,$name:String!,$number:Int!,$threads:Int!,$comments:Int!){
   repository(owner:$owner,name:$name){
+    nameWithOwner
     pullRequest(number:$number){
       reviewThreads(first:$threads){
         nodes{
@@ -1216,6 +1288,7 @@ export class GitHubAdapter implements GitHubApi {
       comments: LIMITS.listEntries,
     });
 
+    await this.assertResolvedRepositoryIdentity(pull.repo, data.repository?.nameWithOwner);
     const nodes = data.repository?.pullRequest?.reviewThreads?.nodes ?? [];
     const threads: ReviewThread[] = [];
     for (const node of nodes) {
@@ -1340,9 +1413,8 @@ export class GitHubAdapter implements GitHubApi {
    * `owner:` qualifier in `query` is dropped before the adapter's own `repo:`
    * is prefixed: GitHub ORs those together, so leaving a caller's in would
    * widen the search past the allow-list, which a user token reaches far
-   * beyond. Whatever GitHub still returns from another repository on the
-   * page is left out, and counted, so no title or link from outside the one
-   * repository reaches the answer.
+   * beyond. Every result must identify the current canonical target; a
+   * missing or unrelated identity fails the entire search closed.
    */
   async searchIssues(repo: RepoRef, query: string, limit: number = LIMITS.listEntries): Promise<IssueSearch> {
     // A qualifier counts wherever no letter, digit, underscore or hyphen comes
@@ -1361,9 +1433,17 @@ export class GitHubAdapter implements GitHubApi {
         q: `repo:${repoSlug(repo)} ${scrubbed}`.trim(),
         per_page: perPage,
       });
-      const items = ((res.data as { items?: (ApiIssue & { repository_url?: string })[] }).items ?? []).slice(0, perPage);
-      const inside = items.filter((item) => sameRepoAsGitHub(repoOfUrl(item.repository_url), repo));
-      const hits = inside.map((item) => ({
+      const items = ((res.data as { items?: ApiIssue[] }).items ?? []).slice(0, perPage);
+      const base = new URL(this.octokit.request.endpoint.DEFAULTS.baseUrl as string);
+      const prefix = `${base.pathname.replace(/\/$/, '')}/repos/`;
+      const canonical = await this.resolvedRepository(repo);
+      for (const item of items) {
+        const actual = item.repository_url ? new URL(item.repository_url) : undefined;
+        const name = actual?.origin === base.origin && actual.pathname.startsWith(prefix)
+          ? actual.pathname.slice(prefix.length) : undefined;
+        assertRepositoryIdentity(canonical, name);
+      }
+      const hits = items.map((item) => ({
         number: item.number ?? 0,
         kind: item.pull_request ? ('pull' as const) : ('issue' as const),
         title: item.title ?? '',
@@ -1371,7 +1451,7 @@ export class GitHubAdapter implements GitHubApi {
         updatedAt: item.updated_at ?? '',
         html_url: item.html_url ?? '',
       }));
-      return { hits, outside: items.length - inside.length };
+      return { hits, outside: 0 };
     });
   }
 
@@ -1472,19 +1552,51 @@ export class GitHubAdapter implements GitHubApi {
     });
   }
 
-  async resolveReviewThread(reviewThreadId: string): Promise<void> {
+  private async resolvedRepository(repo: RepoRef): Promise<RepoRef> {
+    const [owner, name] = (await this.getRepositoryName(repo)).split('/');
+    return { owner, name };
+  }
+
+  private async assertResolvedRepositoryIdentity(repo: RepoRef, actual?: string): Promise<void> {
+    if (!actual) throw new Error('GitHub response omitted repository identity; refusing unverified data');
+    assertRepositoryIdentity(await this.resolvedRepository(repo), actual);
+  }
+
+  /** Revalidate the actual node, not a name lookup or cached membership alone. */
+  private async assertReviewThreadScope(pull: ThreadRef, threadId: string): Promise<void> {
+    // Resolve first: any metadata backoff/auth refresh must precede the final
+    // actual-node query, rather than age that node identity before a write.
+    const canonical = await this.resolvedRepository(pull.repo);
+    const data = await this.graphql<{
+      node?: { pullRequest?: { number?: number; repository?: { nameWithOwner?: string } } };
+    }>('reviewThreadScope', `query($threadId:ID!){
+      node(id:$threadId){ ... on PullRequestReviewThread {
+        pullRequest { number repository { nameWithOwner } }
+      } }
+    }`, { threadId });
+    assertRepositoryIdentity(canonical, data.node?.pullRequest?.repository?.nameWithOwner);
+    if (data.node?.pullRequest?.number !== pull.number) throw new Error('review thread does not belong to the configured pull request');
+  }
+
+  async resolveReviewThread(pull: ThreadRef, reviewThreadId: string): Promise<void> {
+    await this.assertReviewThreadScope(pull, reviewThreadId);
     await this.graphql(
       'resolveReviewThread',
       `mutation($threadId:ID!){ resolveReviewThread(input:{threadId:$threadId}){ thread{ id isResolved } } }`,
       { threadId: reviewThreadId },
+      // A bare node ID must not reuse this scope decision after backoff/auth refresh.
+      { retry: false },
     );
   }
 
-  async unresolveReviewThread(reviewThreadId: string): Promise<void> {
+  async unresolveReviewThread(pull: ThreadRef, reviewThreadId: string): Promise<void> {
+    await this.assertReviewThreadScope(pull, reviewThreadId);
     await this.graphql(
       'unresolveReviewThread',
       `mutation($threadId:ID!){ unresolveReviewThread(input:{threadId:$threadId}){ thread{ id isResolved } } }`,
       { threadId: reviewThreadId },
+      // A bare node ID must not reuse this scope decision after backoff/auth refresh.
+      { retry: false },
     );
   }
 
@@ -1698,7 +1810,7 @@ export class GitHubAdapter implements GitHubApi {
           repo: repo.name,
           branch,
         }),
-        this.octokit.request('GET /repos/{owner}/{repo}', { owner: repo.owner, repo: repo.name }),
+        this.repositoryMetadata(repo),
         this.octokit.request('GET /repos/{owner}/{repo}/pulls', {
           owner: repo.owner,
           repo: repo.name,
@@ -1709,7 +1821,7 @@ export class GitHubAdapter implements GitHubApi {
       ]);
       return {
         protected: (branchRes.data as { protected?: boolean }).protected === true,
-        isDefault: (repoRes.data as { default_branch?: string }).default_branch === branch,
+        isDefault: repoRes.default_branch === branch,
         openPullsBasedOn: Array.isArray(pullsRes.data) ? pullsRes.data.length : 0,
       };
     });
@@ -1934,7 +2046,10 @@ export class GitHubAdapter implements GitHubApi {
       }
       throw err;
     }
-    return { ...head!, notifications };
+    return { ...head!, notifications: notifications.map((notification) => ({
+      ...notification,
+      repo: this.config.repos.find((repo) => sameRepoAsGitHub(notification.repo, this.canonicalRepository(repo))) ?? notification.repo,
+    })) };
   }
 
   /**
@@ -2092,11 +2207,15 @@ export class GitHubAdapter implements GitHubApi {
    * repository is left out. The search names no head, so
    * {@link GitHubAdapter.getPullHeadSha} reads it.
    */
+  private canonicalRepository(repo: RepoRef): RepoRef {
+    return this.canonicalRepositories.get(repoSlug(repo).toLowerCase()) ?? repo;
+  }
+
   async listOwnOpenPulls(login: string, repos: readonly RepoRef[]): Promise<OwnPull[]> {
     if (repos.length === 0) return [];
     return this.call('listOwnOpenPulls', async () => {
       const res = await this.octokit.request('GET /search/issues', {
-        q: `is:pr is:open author:${login} ${repos.map((repo) => `repo:${repoSlug(repo)}`).join(' ')}`,
+        q: `is:pr is:open author:${login} ${repos.map((repo) => `repo:${repoSlug(this.canonicalRepository(repo))}`).join(' ')}`,
         sort: 'updated',
         order: 'desc',
         per_page: 100,
@@ -2111,7 +2230,7 @@ export class GitHubAdapter implements GitHubApi {
       }
       const pulls: OwnPull[] = [];
       for (const item of items) {
-        const repo = repos.find((allowed) => sameRepoAsGitHub(repoOfUrl(item.repository_url), allowed));
+        const repo = repos.find((allowed) => sameRepoAsGitHub(repoOfUrl(item.repository_url), this.canonicalRepository(allowed)));
         if (!repo || !item.pull_request || !item.number) continue;
         pulls.push({ repo, number: item.number, updatedAt: item.updated_at ?? '', html_url: item.html_url ?? '' });
       }
@@ -2176,71 +2295,6 @@ export class GitHubAdapter implements GitHubApi {
   }
 
   /**
-   * Contributor mode: the first problem with GITHUB_REPOS, in list order.
-   * Checks run with bounded concurrency and stop on a lasting failure.
-   * Notifications name a repository as GitHub spells it, and the
-   * allow-list compares exactly, so an entry spelled otherwise ("the-glassy/x"
-   * for "The-Glassy/x") would drop that repository's notifications silently
-   * and refuse its events' tool calls. An entry the token can't see is a
-   * problem too. An entry GitHub didn't answer for (unreachable, a server
-   * error, a rate limit) is left unchecked, with a warning.
-   */
-  async repoSpellingProblems(repos: readonly RepoRef[]): Promise<string[]> {
-    let next = 0;
-    let firstFailure = repos.length;
-    let problem: string | null = null;
-    const inFlight = new Map<number, AbortController>();
-    const fail = (index: number, message: string) => {
-      if (index >= firstFailure) return;
-      firstFailure = index;
-      problem = message;
-      // Earlier entries must finish to select the first failure in list order.
-      // No later entry can change that verdict, so cancel it immediately.
-      for (const [pending, controller] of inFlight) {
-        if (pending > index) controller.abort();
-      }
-    };
-    const worker = async () => {
-      while (next < firstFailure) {
-        const index = next++;
-        const repo = repos[index];
-        const slug = repoSlug(repo);
-        const controller = new AbortController();
-        inFlight.set(index, controller);
-        try {
-          const fullName = await this.call('getRepository', async () => {
-            // Also stop a rate-limit retry if this entry was cancelled during backoff.
-            controller.signal.throwIfAborted();
-            const res = await this.octokit.request('GET /repos/{owner}/{repo}', {
-              owner: repo.owner,
-              repo: repo.name,
-              request: { signal: controller.signal },
-            });
-            return String((res.data as { full_name?: unknown }).full_name ?? '');
-          });
-          if (fullName !== '' && fullName !== slug) {
-            fail(index, `GITHUB_REPOS names "${slug}", but GitHub spells it "${fullName}": set it to "${fullName}", spelled exactly so`);
-          }
-        } catch (err) {
-          if (controller.signal.aborted) continue;
-          if (isLastingFailure(err)) {
-            fail(index, `GITHUB_REPOS names "${slug}", which the token in GITHUB_TOKEN_FILE can't see (${describeFailure(err)})`);
-          } else {
-            this.log('warn', 'GET /repos failed, so a GITHUB_REPOS entry is unchecked against GitHub\'s spelling', {
-              repo: slug,
-              error: err instanceof Error ? err.message : String(err),
-            });
-          }
-        } finally {
-          inFlight.delete(index);
-        }
-      }
-    };
-    await Promise.all(Array.from({ length: Math.min(REPO_CHECK_CONCURRENCY, repos.length) }, worker));
-    return problem === null ? [] : [problem];
-  }
-
-  /**
    * App mode: the App's own identity. `GET /app` is JWT-authenticated and
    * answers with the App's slug; the login that appears as a comment author
    * is that slug with `[bot]` appended, which is what GITHUB_BOT_LOGIN holds.
@@ -2287,8 +2341,10 @@ export class GitHubAdapter implements GitHubApi {
   // ───────────────────────────────────────────────────────────────────────────
 
   /** A GraphQL call with the same retry, redaction and auth as a REST one. */
-  private async graphql<T>(operation: string, query: string, variables: Record<string, unknown>): Promise<T> {
-    return this.call(operation, () => this.octokit.graphql<T>(query, variables));
+  private async graphql<T>(
+    operation: string, query: string, variables: Record<string, unknown>, opts: { retry?: boolean } = {},
+  ): Promise<T> {
+    return this.call(operation, () => this.octokit.graphql<T>(query, variables), opts);
   }
 
   /**
@@ -2357,6 +2413,15 @@ export class GitHubAdapter implements GitHubApi {
 
   /** A pull request payload plus the check runs on its head sha. */
   private async mapPull(repo: RepoRef, data: ApiPull): Promise<PullRequest> {
+    let headRepo = headRepoOf(data.head);
+    if (headRepo) {
+      // The tools compare the head to the configured alias, not its current name.
+      // Only rebind a head that actually belongs to that alias's canonical target;
+      // a fork (including one reusing the old spelling) must remain fenced out.
+      const canonical = await this.resolvedRepository(repo);
+      headRepo = sameRepoAsGitHub(headRepo, canonical) ? repo
+        : sameRepoAsGitHub(headRepo, repo) ? null : headRepo;
+    }
     const headSha = data.head?.sha ?? '';
     let checksSummary: ChecksSummary | null = null;
     if (headSha) {
@@ -2377,7 +2442,7 @@ export class GitHubAdapter implements GitHubApi {
       mergeable: data.mergeable ?? null,
       head: { ref: data.head?.ref ?? '', sha: headSha },
       base: { ref: data.base?.ref ?? '', sha: data.base?.sha ?? '' },
-      headRepo: headRepoOf(data.head),
+      headRepo,
       author: actorOf(data.user),
       requestedReviewers: (data.requested_reviewers ?? [])
         .map((r) => r?.login ?? '')

@@ -29,12 +29,14 @@ writeFileSync(
   { mode: 0o600 },
 );
 
-type Answer = { status: number; body?: unknown } | 'lost';
+type ResponseAnswer = { status: number; body?: unknown } | 'lost';
+type Answer = ResponseAnswer | ((body: string) => ResponseAnswer);
 
 class FakeGitHub {
   readonly received: { method: string; path: string; body: string }[] = [];
   private readonly answers = new Map<string, Answer>([
     [`POST /app/installations/${INSTALLATION_ID}/access_tokens`, { status: 201, body: { token: 'ghs_test', expires_at: new Date(Date.now() + 3_600_000).toISOString() } }],
+    [`GET ${R}`, { status: 200, body: { full_name: 'anima-research/rayforce' } }],
     [`GET ${R}/installation`, { status: 200, body: { id: INSTALLATION_ID } }],
   ]);
   private server: Server | null = null;
@@ -52,7 +54,8 @@ class FakeGitHub {
       req.on('end', () => {
         const path = new URL(req.url ?? '/', 'http://x').pathname;
         this.received.push({ method: req.method ?? '', path, body });
-        const answer = this.answers.get(`${req.method} ${path}`) ?? { status: 404, body: { message: 'Not Found' } };
+        const handler = this.answers.get(`${req.method} ${path}`) ?? { status: 404, body: { message: 'Not Found' } };
+        const answer = typeof handler === 'function' ? handler(body) : handler;
         if (answer === 'lost') {
           req.socket.destroy();
           return;
@@ -190,9 +193,14 @@ test('a write GitHub refused with a 4xx still reads as failed', { timeout: 10_00
 });
 
 test('a GraphQL mutation whose answer was lost may have taken effect; a GraphQL query may not', { timeout: 10_000 }, async () => {
-  const { adapter } = await rig({ 'POST /graphql': 'lost' });
+  const { adapter } = await rig({ 'POST /graphql': (body) => {
+    const query = JSON.parse(body).query as string;
+    return query.includes('node(id:')
+      ? { status: 200, body: { data: { node: { pullRequest: { number: 12, repository: { nameWithOwner: 'anima-research/rayforce' } } } } } }
+      : 'lost';
+  } });
 
-  const mutation = await adapter.resolveReviewThread('PRRT_x').then(
+  const mutation = await adapter.resolveReviewThread(PULL, 'PRRT_x').then(
     () => assert.fail('resolveReviewThread should have thrown'),
     (err: unknown) => err,
   );

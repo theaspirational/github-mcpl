@@ -220,6 +220,15 @@ export function tagsFor(event: NormalizedEvent, ctx: GitHubTagContext): TagResul
       if (ciFailure) tags.add('github:ci=failure');
       else if (event.checks?.conclusion === 'success') tags.add('github:ci=success');
       break;
+    case 'installation.unavailable':
+    case 'installation.available':
+      tags.add(`github:installation=${event.kind.slice('installation.'.length)}`);
+      break;
+    case 'repo.unavailable':
+    case 'repo.available':
+    case 'repo.renamed':
+      tags.add(`github:repo=${event.kind.slice('repo.'.length)}`);
+      break;
     case 'push':
       tags.add('github:push');
       break;
@@ -238,6 +247,17 @@ export function tagsFor(event: NormalizedEvent, ctx: GitHubTagContext): TagResul
   if (isMaintainer) tags.add('github:actor=maintainer');
 
   const metadata: EventMetadata = {
+    ...(event.installation ? {
+      installationUnavailable: event.kind === 'installation.unavailable',
+      reason: bounded(event.installation.reason, 512),
+      status: event.installation.status ?? null,
+      operation: event.installation.operation ?? null,
+    } : {}),
+    ...(event.availability ? {
+      repoUnavailable: event.kind === 'repo.unavailable',
+      reason: bounded(event.availability.reason, 512),
+      ...(event.availability.canonicalName ? { canonicalName: bounded(event.availability.canonicalName, METADATA_LIMITS.scalarChars) } : {}),
+    } : {}),
     mentioned,
     isOwnThread,
     isReplyToSelf,
@@ -245,7 +265,7 @@ export function tagsFor(event: NormalizedEvent, ctx: GitHubTagContext): TagResul
     isCiFailure: ciFailure,
     fromSelf,
     isMaintainer,
-    repo: bounded(repoSlug(event.repo), METADATA_LIMITS.scalarChars),
+    repo: event.installation ? 'github-mcpl' : bounded(repoSlug(event.repo), METADATA_LIMITS.scalarChars),
     number: event.thread ? event.thread.number : null,
     kind: event.thread ? event.thread.kind : null,
     actor: bounded(event.actor.login, METADATA_LIMITS.scalarChars),
@@ -325,6 +345,11 @@ export const GITHUB_TAG_ONTOLOGY: TagOntology = {
       desc: 'Checks on a head sha failed, timed out, or require action',
       facet: 'content',
     },
+    'github:installation=unavailable': { desc: 'Shared App installation authentication unavailable', facet: 'lifecycle' },
+    'github:installation=available': { desc: 'Shared App installation authentication recovered', facet: 'lifecycle' },
+    'github:repo=unavailable': { desc: 'Configured repository is unavailable; operator action may be needed', facet: 'lifecycle' },
+    'github:repo=available': { desc: 'Configured repository recovered', facet: 'lifecycle' },
+    'github:repo=renamed': { desc: 'Configured repository resolves to a new name or owner; update configuration', facet: 'lifecycle' },
     'github:push': { desc: 'Commits were pushed to a branch', facet: 'lifecycle' },
     'github:read-failed': { desc: 'Contributor mode stopped reading a thread until it next moves', facet: 'lifecycle' },
     'github:actor=maintainer': {
@@ -333,6 +358,8 @@ export const GITHUB_TAG_ONTOLOGY: TagOntology = {
     },
   },
   keyed: {
+    installation: { desc: 'Shared App installation authentication', values: ['unavailable', 'available'] },
+    repo: { desc: 'Configured repository availability', values: ['unavailable', 'available', 'renamed'] },
     issue: {
       desc: 'Issue lifecycle transition',
       values: ['opened', 'edited', 'closed', 'reopened'],

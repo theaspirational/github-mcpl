@@ -245,13 +245,83 @@ told where Node is instead of looking.
 | `GITHUB_WEBHOOK_PATH` | no | `/github/webhook` | Path the listener answers on. |
 | `GITHUB_POLL_INTERVAL_MS` | no | `0` (off) | Polling fallback: issues and PRs, issue comments and review comments updated since each list's cursor, plus the checks on the heads of the open PRs seen. `0` is off; a non-zero value below `60000` is refused. Partial — it cannot see a submitted review, a review request or a push ([what polling misses](docs/deploy.md#option-3--polling-only-no-webhook-at-all)) — and it is not meant to run alongside the webhook. |
 | `GITHUB_CHECKS_EMIT` | no | `all` | `all` preserves the existing checks event stream; `failures` suppresses green `checks.completed` events in every ingress path. Other values refuse startup. See [checks emission](#checks-emission). |
-| `GITHUB_REPOS` | yes | — | Comma-separated `owner/name` allow-list; a write anywhere else is refused by name. Several entries must share one owner (one App installation, one token); a second owner is a second server process. With several, every tool call names its repository. |
+| `GITHUB_REPOS` | yes | — | Comma-separated `owner/name` allow-list; tools name a configured entry, including its GitHub-resolved rename/transfer target. Several entries must share one owner (one App installation, one token); a second owner is a second server process. With several, every tool call names its repository. Definitively gone/inaccessible entries are set aside; the connector stays up even when none validate (see below). |
 | `GITHUB_PR_BASE_ALLOW` | no | empty = no PR target allowed | Branches a pull request may target or be retargeted to. A plain `branch` applies to every repository, `owner/name:branch` to that one: `anima-research/rayforce:dev,main`. |
 | `GITHUB_MERGE_BASE_ALLOW` | no | empty = no merge | Branches `merge_pull_request` may merge into, in the same format. Naming a branch here is what turns merging on; granting `github.merge` alone does not. |
 | `GITHUB_WORKFLOW_ALLOW` | no | empty = no dispatch or re-run | Workflow files (`review.yml`, or `owner/name:review.yml` for one repository) that `dispatch_workflow` and `rerun_workflow_run` may start. Never name a release or publish workflow you would not let the agent run. |
 | `GITHUB_STATE_FILE` | no | unset = in-memory only | Durable JSON: checkpoint lineage, rollback bookkeeping, and the polling state: a cursor for each repository and list (`pollCursors`), `lastPollAt` where a list with none starts, and the rows announced as new (`pollNew`). A list with a cursor of its own starts from it, not from `lastPollAt`. |
 | `GITHUB_BOT_LOGIN` | yes | — | The App's bot login, e.g. `rayforce-clone[bot]`. From-self and mention detection depend on it. |
 | `GITHUB_MAINTAINERS` | no | empty | Comma-separated logins marked `isMaintainer` in metadata and tagged `github:actor=maintainer`. |
+
+#### Repository availability
+
+Startup checks each configured name using the configured App or contributor token,
+with at most eight repository probes in flight. A failed entry does not cancel
+its siblings. Definitively
+missing or inaccessible repositories (404/410/access-denied 403) are **set aside**,
+with a warning on stderr; healthy repositories continue normally. Malformed entries
+and other configuration errors remain fatal. Even when one or all repositories are
+unavailable, startup stays alive to deliver events and recheck; unvalidated repository
+operations fail closed.
+
+**Upstream rename compatibility is preserved:** a configured entry that GitHub
+resolves to another canonical name keeps working, including a transfer to another
+owner when the existing token can access it. In App mode, configured entries must still share
+one owner (contributor mode permits multiple owners); this does not admit arbitrary repositories or add the canonical name
+as a separate tool-addressable entry. A `repo.renamed` event names both the configured
+and canonical `owner/name` so the agent can update `GITHUB_REPOS`. It emits once per
+observed canonical target, repeating only when that target changes again; case-only
+differences are silent. This notice does not disable operations or require an update
+to keep using a working redirect.
+
+An independent hourly check runs even with `GITHUB_POLL_INTERVAL_MS=0` and
+re-enables repositories reachable through their configured entries. Repository
+errors during tools or polling trigger an earlier check; a missing issue alone
+does not disable its repository. Content reads/writes and installation discovery
+retain upstream fetch redirect semantics. Metadata follows constrained same-origin
+redirects to identify the target. Rename notices appear on startup or the next
+metadata check (including Search/GraphQL/node validation and pull-head/branch
+safety checks), not every redirected read. Same-repository pull heads are bound
+to the current canonical target; fork heads and base-branch protections remain
+refused by merge/update tools as before.
+
+Search results and GraphQL thread responses must identify the canonical target
+that a fresh lookup through the configured entry resolves to, not an unrelated
+repository. Review-thread mutations also validate the actual node's pull number.
+Resolve/unresolve mutations are not automatically retried, including after rate-limit
+or authentication rejection; a new invocation must validate scope again.
+GitHub offers no atomic target condition on these node-ID mutations: a scope change
+after final validation but before mutation execution remains an API limitation.
+Tools, channel open (including cached descriptors), publish, and history targeting
+a set-aside repository refuse with its reason. Local channel list/close/typing
+remain available; they do not access GitHub repository data. Poll cursors are held
+for unavailable repositories so recovery can catch up without blocking siblings.
+
+Network errors, rate limits (including HTTP 429 and rate-limited 403), and 5xx
+responses do **not** change the last confirmed availability or emit lifecycle
+events. A required validation that fails transiently fails that operation;
+independent retries start after 5 seconds with exponential backoff capped at
+60 seconds (timer resolution: 5 seconds). Unvalidated startup repositories stay
+closed until a probe succeeds or returns a definitive answer. Without an explicit
+installation ID, failed installation discovery shares one result and 5–60 second
+retry backoff across repositories, rather than repeating the traversal per probe.
+Discovery still tries healthy siblings when earlier entries fail.
+
+Availability and rename changes emit `repo.unavailable` / `repo.available` /
+`repo.renamed` through `github.events`, with corresponding `github:repo=unavailable` /
+`github:repo=available` / `github:repo=renamed` tags, the configured repository, a
+reason, and the canonical name for rename notices.
+These are repository-level pushes, not thread/channel messages. Hosts must
+negotiate MCPL and grant `pushEvents` and `github.events`; plain MCP only sees
+stderr warnings and tool refusals. The manifest suggests immediate treatment;
+hosts with custom wake rules should explicitly route these tags. See
+[the event reference](docs/events.md#repository-availability).
+
+Only changes emit events, not every poll. Before a host can accept a push, the
+latest pending availability state and rename notice per repository are retained
+separately in memory. Restarting validates and reports current outages/renames afresh. Whether all repositories
+are unavailable at startup or become unavailable later, the process stays up to
+report the outage and check for recovery.
 
 ### 8. Build and run it
 
@@ -319,7 +389,7 @@ For a resident that contributes to repositories it **cannot install the App on**
 |---|---|---|---|
 | `GITHUB_TOKEN_FILE` | yes (instead of the App variables) | — | Path to a personal access token (classic), mode 600. See **The token** below. |
 | `GITHUB_BOT_LOGIN` | no | the token's login | The token owner's login, spelled as GitHub spells it (no `[bot]`). From-self and mention detection use it. Unset, the server takes it from `GET /user` at start, and stops when GitHub doesn't answer. Set, it is checked against the token's own login when GitHub answers, and the server stops if they differ; when GitHub doesn't answer, it starts unchecked and logs a warning. |
-| `GITHUB_REPOS` | yes | — | The repositories the agent works in, and the write allow-list. In this mode it may span several owners. Notifications from any other repository are dropped. Spell each as GitHub does: at start the server checks each against GitHub and stops on a different spelling, or a repository the token can't see. |
+| `GITHUB_REPOS` | yes | — | The repositories the agent works in, and the write allow-list. In this mode it may span several owners. Notifications from any other repository are dropped. Startup checks each independently with bounded concurrency. Missing/denied entries are set aside; renamed/transferred entries remain usable through redirects and emit `repo.renamed`. Case-only differences are silent. Notifications and own-PR checks map the resolved name back to its configured entry. |
 | `GITHUB_POLL_INTERVAL_MS` | no | `60000` | Notifications poll interval; values below `60000` are refused. GitHub's `X-Poll-Interval` is honoured when it asks for longer. |
 | `GITHUB_CHECKS_EMIT` | no | `all` | `all` preserves the existing checks event stream; `failures` suppresses green `checks.completed` events in every ingress path. Other values refuse startup. See [checks emission](#checks-emission). |
 | `GITHUB_STATE_FILE` | recommended | — | Keeps the notifications watermark, when GitHub last answered, each thread's cursor, the threads to read again and the dedup ring across restarts. Without it, every start begins as a first start does (below): activity from a longer downtime isn't delivered, and some from before the start can arrive twice. |
@@ -367,7 +437,7 @@ the re-run request. Runs outside those heads must also be polled with
 
 **The account.** Use an account the agent alone posts from, such as a machine account. GitHub shows the agent's comments, reviews and pull requests as that account's, and this server treats everything that account does as the agent's own: its own events are tagged from-self and don't wake it, and the comment tools let it edit and delete that account's comments. This is account ownership, not proof that this process wrote a comment. A human's later edits are not protected by a version check: an edit or sticky update can overwrite them, and rollback can restore an older body or delete an agent-created comment after a human changed it. Do not share the posting account or treat rollback as safe concurrent editing.
 
-**How events get in.** Notification polling pauses without API calls or state changes until a connected MCPL host has at least one granted event egress, and pauses again if that ceases to be true. The server lists `GET /notifications?all=true&participating=true&since=…` from where the last listing got to, with `If-Modified-Since` after a complete listing, so an idle inbox can return a `304` that doesn't count against the rate limit. Truncated listings instead retain their window for an unconditional retry. Read and unread threads are listed alike, and nothing is marked read. For each listed issue or pull request in `GITHUB_REPOS`, it reads what is new since its last read: comments, a pull request's review comments and submitted reviews, and its state. Each becomes the same `push/event` and `channels/incoming`, with the same tags and metadata, as in App mode. A thread opened since the last pass arrives as opened, a close or merge as closed (a merge tagged `github:pr=merged` too), with whoever closed or merged it as the actor, and an edit to an issue as edited, attributed to whoever opened it, since GitHub's row doesn't say who edited it; a thread opened and closed between two passes arrives as closed. An edit to a closed issue or pull request arrives as nothing. A reopened issue arrives as edited, as with App mode's repository poll, and a reopened pull request as nothing, as with a webhook delivery. A listed pull request whose notification gives `review_requested` as its reason arrives as `pull.review_requested` too, with the pull request's author as the actor, since the notification doesn't say who asked. It arrives once for each update of the notification listed with that reason, so if GitHub keeps the reason while the thread moves on, a later update, a comment for one, brings it again. Each pass also looks up the checks on the heads of the open pull requests the token's user authored in `GITHUB_REPOS`, the 100 most recently updated, 20 a pass and in turns past that, and a head whose checks have all finished arrives as `checks.completed`, as in App mode, once for each conclusion and set of failed jobs. Once a head's result has arrived with every run finished, it isn't looked up again until its pull request is updated or ten minutes have passed since its head was read, so a re-run on the same head is seen on the first look after that, a pass or so past ten minutes. A head with no check runs two minutes after it was read is left the same way, so runs created later than that arrive with the next look. A failure that arrives while other runs go is looked up each pass until they finish. The tools' `search_issues` searches one repository in `GITHUB_REPOS`: it drops `repo:`, `user:`, `org:` and `owner:` qualifiers from the query, and leaves out, and counts, any result on the page from another repository.
+**How events get in.** Notification polling pauses without API calls or state changes until a connected MCPL host has at least one granted event egress, and pauses again if that ceases to be true. The server lists `GET /notifications?all=true&participating=true&since=…` from where the last listing got to, with `If-Modified-Since` after a complete listing, so an idle inbox can return a `304` that doesn't count against the rate limit. Truncated listings instead retain their window for an unconditional retry. Read and unread threads are listed alike, and nothing is marked read. For each listed issue or pull request in `GITHUB_REPOS`, it reads what is new since its last read: comments, a pull request's review comments and submitted reviews, and its state. Each becomes the same `push/event` and `channels/incoming`, with the same tags and metadata, as in App mode. A thread opened since the last pass arrives as opened, a close or merge as closed (a merge tagged `github:pr=merged` too), with whoever closed or merged it as the actor, and an edit to an issue as edited, attributed to whoever opened it, since GitHub's row doesn't say who edited it; a thread opened and closed between two passes arrives as closed. An edit to a closed issue or pull request arrives as nothing. A reopened issue arrives as edited, as with App mode's repository poll, and a reopened pull request as nothing, as with a webhook delivery. A listed pull request whose notification gives `review_requested` as its reason arrives as `pull.review_requested` too, with the pull request's author as the actor, since the notification doesn't say who asked. It arrives once for each update of the notification listed with that reason, so if GitHub keeps the reason while the thread moves on, a later update, a comment for one, brings it again. Each pass also looks up the checks on the heads of the open pull requests the token's user authored in `GITHUB_REPOS`, the 100 most recently updated, 20 a pass and in turns past that, and a head whose checks have all finished arrives as `checks.completed`, as in App mode, once for each conclusion and set of failed jobs. Once a head's result has arrived with every run finished, it isn't looked up again until its pull request is updated or ten minutes have passed since its head was read, so a re-run on the same head is seen on the first look after that, a pass or so past ten minutes. A head with no check runs two minutes after it was read is left the same way, so runs created later than that arrive with the next look. A failure that arrives while other runs go is looked up each pass until they finish. The tools' `search_issues` searches one repository in `GITHUB_REPOS`: it drops `repo:`, `user:`, `org:` and `owner:` qualifiers from the query, and fails closed if a result omits repository identity or names anything other than the configured entry’s current canonical target.
 
 **What a pass costs.** The listing, one request a page of 50 threads, free when it's a `304`. One search for the token user's open pull requests, on the search API's own limit of 30 a minute, which the tools' `search_issues` shares, on every pass whose thread reads met no rate limit, a `304`'s included. Then for each of them not left as above, up to 20 a pass and in turns past that, one check-runs request, more past 100 runs, and one more for its head when it moved since the last pass or that read is ten minutes old. With 20 open pull requests whose checks have finished and nothing moving, that's about 240 requests an hour, besides the 60 searches. Then, for each thread it lists or that waits, two requests for an issue (its row and its comments) and four for a pull request (its row, its comments, its review comments and its reviews), each list taking more when its new rows run past a page, and the reviews one more once a pull request has more than 100 reviews. The first time the server handles an event on a thread after it starts, its event pipeline also reads the thread itself (for a pull request, with its head's check runs), its comments and a pull request's review threads, to learn whether the agent took part there, as in App mode. The agent's own tool calls draw on the same 5,000 an hour.
 

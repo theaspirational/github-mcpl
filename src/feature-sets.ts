@@ -88,6 +88,8 @@ const GITHUB_TAG_DESCRIPTIONS: Record<string, string> = {
   'github:ci': 'The check runs on a pull request head finished, with their conclusion.',
   'github:actor': 'Who acted, where the deployment distinguishes them (maintainer).',
   'github:review-comment': 'A comment on a line of a diff, inside a review thread.',
+  'github:installation': 'Shared App installation authentication unavailable or recovered; check connector configuration.',
+  'github:repo': 'Availability of a configured repository changed; unavailable includes a reason and possibly a suggested name.',
   'github:push': 'Commits were pushed to a branch.',
   'github:read-failed': 'Contributor mode stopped reading a thread, and says why.',
 };
@@ -140,6 +142,8 @@ export function buildTagOntology(): TagOntology {
     },
     // A red build on work the bot is involved in.
     { tagsAny: ['github:ci=failure'], behavior: 'immediate' },
+    { tagsAny: ['github:installation=unavailable', 'github:installation=available'], behavior: 'immediate' },
+    { tagsAny: ['github:repo=unavailable', 'github:repo=available', 'github:repo=renamed'], behavior: 'immediate' },
     // Repository background noise.
     { tagsAny: ['chat:ambient', 'github:push', 'github:ci=success'], behavior: { throttle: { perMs: 120_000 } } },
   ];

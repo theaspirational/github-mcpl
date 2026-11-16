@@ -64,7 +64,14 @@ function parseEndpoint(raw: unknown): Parsed<boolean | undefined> {
 }
 
 function repoRefused(repo: RepoRef, ctx: ToolContext): string | null {
-  if (repoAllowed(repo, ctx.repos)) return null;
+  if (repoAllowed(repo, ctx.repos)) {
+    try {
+      ctx.assertRepoAvailable?.(repo);
+    } catch (err) {
+      return (err as Error).message;
+    }
+    return null;
+  }
   return `refused: ${repoSlug(repo)} is not in GITHUB_REPOS (${ctx.repos.map(repoSlug).join(', ') || 'empty'})`;
 }
 

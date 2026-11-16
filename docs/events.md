@@ -31,6 +31,7 @@ capability grant's decision; a tag only influences treatment afterwards.
 | `check_suite` (`completed`) | `getCheckRuns` on an open PR head (contributor mode: on the head of each open PR the token's user authored, the 100 most recently updated, until a result with every run finished arrives, or for two minutes with no runs, and again when it moves or ten minutes on) | `checks.completed` | pull |
 | `push` | — | `push` | *none* |
 | — (contributor mode only: the notifications poller stopped reading a thread) | — | `thread.read_failed` | issue or pull |
+| repository validation | hourly check / API failure | `repo.unavailable`, `repo.available`, `repo.renamed` | *none* |
 
 A `push` event carries no thread, so its channel id, `metadata.number` and
 `metadata.kind` are absent — a recipe that routes on a thread must not expect
@@ -62,6 +63,9 @@ pair**, and then the rows below.
 | `checks.completed` | `github:ci=failure`, or `github:ci=success`, or *neither* — see below | |
 | `push` | `github:push` | |
 | `thread.read_failed` | `github:read-failed` | |
+| `repo.unavailable` | `github:repo=unavailable` | |
+| `repo.available` | `github:repo=available` | |
+| `repo.renamed` | `github:repo=renamed` | |
 
 A `thread.read_failed` event is contributor mode's notifications poller saying,
 on the thread's own channel, that it stopped reading that thread's new
@@ -229,3 +233,42 @@ Two things it deliberately does not do:
   *quieter*. The single `immediate` suggestion requires `chat:reply` beside
   `github:ci=failure` — CI broke on a thread the agent is already in. They are
   advisory either way (RFC-001 §5.2) and apply only on explicit acceptance.
+
+## Repository availability
+
+`repo.unavailable` means GitHub definitively reported the configured entry gone or
+inaccessible (404/410/access-denied 403). `repo.available` means it subsequently
+became reachable through that entry again, including via a working rename/transfer
+redirect. Initial healthy repositories and repeated identical failures are silent.
+A changed definitive failure reason emits a new unavailable event.
+
+`repo.renamed` reports a different canonical `owner/name` reached through the
+configured entry. Operations keep working exactly as upstream's redirect-following
+allows, including transfers accessible with the existing token. The event helps the
+agent update configuration; it does not quarantine the repository or add the new
+name as a separately addressable configured entry. Emit once per observed target,
+repeat only when the canonical target changes again, and ignore case-only changes.
+
+Checks run hourly independently of polling and on relevant operation failures.
+Search/GraphQL/node identity checks also resolve the configured entry's current
+target. A redirected REST read alone need not emit a notice before the next metadata
+check. Network failures, rate limits, 401, and server errors preserve the last
+confirmed state and emit no outage/recovery noise; validation retries use 5–60 second
+backoff. Startup remains connected even if every repository is unavailable.
+
+All three events use the configured `origin.repo`, `origin.kind`, and bounded text.
+`origin.metadata` carries `repoUnavailable` (true only for `repo.unavailable`),
+`reason`, and `canonicalName` for rename notices, including the new owner on transfers.
+The actor is the connector (`github-mcpl`, a bot); tags include `chat:from-bot`,
+`chat:ambient`, and the corresponding `github:repo` tag. There is no thread or channel:
+`metadata.number` and `metadata.kind` are null, and no `channels/incoming` is sent.
+
+The manifest suggests immediate treatment for all three tags. Custom wake policies
+should put explicit `github:repo=unavailable` / `github:repo=available` /
+`github:repo=renamed` rules before general ambient/bot mute rules. Delivery needs
+`github.events` and `pushEvents`; plain MCP has no event transport. Before grant,
+the server retains the latest availability state and latest rename notice separately
+per repository. Updates coalesce, rather than replaying an outage/rename history;
+a recovery must not erase a still-undelivered rename notice. Refused pushes remain
+pending for the next grant update or inbound event. Restarting validates and reports
+current outages/renames anew; this is not a durable event queue.

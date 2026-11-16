@@ -273,12 +273,12 @@ test('resolve_thread and unresolve_thread move a thread of the named pull reques
   assert.equal(resolved, 'resolved review thread RT_kwDO on anima-research/rayforce#8');
   assert.deepEqual(api.callLog(), ['listReviewThreads', 'resolveReviewThread']);
   assert.deepEqual(api.callsTo('listReviewThreads')[0].args, [PULL]);
-  assert.deepEqual(api.callsTo('resolveReviewThread')[0].args, ['RT_kwDO']);
+  assert.deepEqual(api.callsTo('resolveReviewThread')[0].args, [PULL, 'RT_kwDO']);
   assert.equal((await api.listReviewThreads(PULL))[0].isResolved, true);
 
   const unresolved = ok(await reviewToolModule.call('unresolve_thread', { number: 8, threadId: 'RT_kwDO' }, ctx(api)));
   assert.equal(unresolved, 'unresolved review thread RT_kwDO on anima-research/rayforce#8');
-  assert.deepEqual(api.callsTo('unresolveReviewThread')[0].args, ['RT_kwDO']);
+  assert.deepEqual(api.callsTo('unresolveReviewThread')[0].args, [PULL, 'RT_kwDO']);
   assert.equal((await api.listReviewThreads(PULL))[0].isResolved, false);
 });
 

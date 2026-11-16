@@ -14,20 +14,20 @@ globalThis.fetch = async (input, init) => {
     await setTimeout(300, undefined, { signal: init?.signal });
     return Response.json({ login: 'tester' });
   }
+  if (url.pathname === '/repositories/101') return Response.json({ full_name: 'new-owner/renamed' });
   if (!/^\/repos\/owner\/repo\d+$/.test(url.pathname)) throw new Error(`Unexpected fetch: ${url.pathname}`);
   const index = Number(url.pathname.match(/repo(\d+)$/)[1]);
   started++;
   peak = Math.max(peak, ++active);
   try {
-    // The later failure arrives first. Earlier entries must still determine
-    // the diagnostic, and later in-flight requests must be cancelled.
+    // A later unavailable entry answers first; no sibling is cancelled.
     const latency = failure && index === 4 ? 20 : failure && index === 1 ? 100 : 300;
     await setTimeout(latency, undefined, { signal: init?.signal });
     completed++;
     if (failure && (index === 1 || index === 4)) {
-      return failure === '404'
+      return failure === '404' || (failure === 'mixed' && index === 4)
         ? Response.json({ message: 'Not Found' }, { status: 404 })
-        : Response.json({ full_name: `Owner/repo${index}` });
+        : new Response(null, { status: 301, headers: { location: 'https://api.github.com/repositories/101' } });
     }
     return Response.json({ full_name: url.pathname.slice('/repos/'.length) });
   } catch (err) {

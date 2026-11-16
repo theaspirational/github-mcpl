@@ -6,6 +6,10 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SERVER = fileURLToPath(new URL("../dist/src/index.js", import.meta.url));
+const scenario = process.argv[2] ?? 'healthy';
+if (!['healthy', 'missing', 'all-missing', 'renamed', 'transient', 'mixed'].includes(scenario)) {
+  throw new Error(`unknown offline startup scenario: ${scenario}`);
+}
 const ANSWER_MS = 30_000;
 const EXIT_MS = 10_000;
 
@@ -21,11 +25,12 @@ writeFileSync(
   { mode: 0o600 },
 );
 
-const child = spawn(process.execPath, [SERVER, "--stdio"], {
+const child = spawn(process.execPath, ["--import", fileURLToPath(new URL("./ci-github-fetch.mjs", import.meta.url)), SERVER, "--stdio"], {
   env: {
     GITHUB_APP_ID: "1",
     GITHUB_APP_PRIVATE_KEY_FILE: keyFile,
-    GITHUB_REPOS: "example/repo",
+    GITHUB_REPOS: scenario === "mixed" ? "example/repo,example/renamed,example/missing" : scenario === "all-missing" ? "example/repo,example/other" : "example/repo",
+    CI_START_SCENARIO: scenario,
     GITHUB_BOT_LOGIN: "example[bot]",
     GITHUB_POLL_INTERVAL_MS: "0",
   },
@@ -36,6 +41,47 @@ let stdout = "";
 let stderr = "";
 let answered = false;
 let finished = false;
+let mixedVerified = false;
+const mixedEvents = new Set();
+const mixedTools = new Set();
+
+function send(message) {
+  child.stdin.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n');
+}
+
+function closeInput() {
+  clearTimeout(timer);
+  timer = setTimeout(() => finish(1, `the server didn't exit within ${EXIT_MS / 1000} s of its stdin closing`), EXIT_MS);
+  child.stdin.end();
+}
+
+function mixedAnswer(msg) {
+  if (msg.method === 'push/event') {
+    const event = msg.params;
+    const expected = event.origin?.kind === 'repo.renamed'
+      ? event.origin.repo === 'example/renamed' && event.origin.metadata?.canonicalName === 'new-owner/current'
+      : event.origin?.kind === 'repo.unavailable' && event.origin.repo === 'example/missing';
+    if (!expected) return finish(1, `unexpected mixed availability event: ${clip(JSON.stringify(event), 500)}`);
+    mixedEvents.add(event.origin.kind);
+    send({ id: msg.id, result: { accepted: true } });
+  } else if (msg.id === 2) {
+    if (msg.error) return finish(1, 'mixed feature grant failed');
+    for (const [id, repo] of [[3, 'example/repo'], [4, 'example/renamed'], [5, 'example/missing']]) {
+      send({ id, method: 'tools/call', params: { name: 'get_issue', arguments: { repo, number: 1 } } });
+    }
+  } else if ([3, 4, 5].includes(msg.id)) {
+    const content = JSON.stringify(msg.result?.content);
+    const valid = !msg.error && (msg.id === 5
+      ? msg.result?.isError === true && /unavailable/.test(content)
+      : !msg.result?.isError && /offline issue/.test(content));
+    if (!valid) return finish(1, `mixed tool check failed: ${clip(JSON.stringify(msg), 500)}`);
+    mixedTools.add(msg.id);
+  }
+  if (!mixedVerified && mixedEvents.size === 2 && mixedTools.size === 3) {
+    mixedVerified = true;
+    closeInput();
+  }
+}
 let timer = setTimeout(() => finish(1, `no answer to initialize within ${ANSWER_MS / 1000} s`), ANSWER_MS);
 
 function finish(code, message) {
@@ -44,7 +90,7 @@ function finish(code, message) {
   clearTimeout(timer);
   if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
   rmSync(dir, { recursive: true, force: true });
-  const line = `ci-start-check (Node ${process.version}): ${message}`;
+  const line = `ci-start-check/${scenario} (Node ${process.version}): ${message}`;
   if (code === 0) console.log(line);
   else {
     console.error(line);
@@ -69,6 +115,7 @@ function onAnswer(line) {
     finish(1, `the server wrote a line that isn't a JSON-RPC message: ${clip(line, 200)}`);
     return;
   }
+  if (answered && scenario === 'mixed') return mixedAnswer(msg);
   if (msg.id !== 1) return;
   const mcpl = msg.result?.capabilities?.experimental?.mcpl;
   if (msg.jsonrpc !== "2.0" || "error" in msg || mcpl === null || typeof mcpl !== "object") {
@@ -76,16 +123,19 @@ function onAnswer(line) {
     return;
   }
   answered = true;
-  clearTimeout(timer);
-  timer = setTimeout(() => finish(1, `the server didn't exit within ${EXIT_MS / 1000} s of its stdin closing`), EXIT_MS);
-  child.stdin.end();
+  if (scenario === 'mixed') {
+    clearTimeout(timer);
+    timer = setTimeout(() => finish(1, 'mixed event/tool checks timed out'), ANSWER_MS);
+    send({ method: 'notifications/initialized' });
+    send({ id: 2, method: 'featureSets/update', params: { effectiveCapabilities: ['tools', 'pushEvents'] } });
+  } else closeInput();
 }
 
 child.stdout.setEncoding("utf8");
 child.stdout.on("data", (chunk) => {
   stdout += chunk;
   let nl;
-  while (!answered && !finished && (nl = stdout.indexOf("\n")) >= 0) {
+  while (!finished && (nl = stdout.indexOf("\n")) >= 0) {
     const line = stdout.slice(0, nl).trim();
     stdout = stdout.slice(nl + 1);
     if (line) onAnswer(line);
@@ -98,7 +148,12 @@ child.on("close", (code, signal) => {
   if (finished) return;
   if (!answered) finish(1, `the server exited (${signal ?? `code ${code}`}) before answering initialize`);
   else if (code !== 0) finish(1, `the server exited (${signal ?? `code ${code}`}) after answering initialize, not with 0`);
-  else finish(0, "the built server answered initialize over --stdio and exited 0");
+  else if (scenario === 'mixed' && (!mixedVerified || !stderr.includes('repository renamed or transferred') || !stderr.includes('repository set aside'))) {
+    finish(1, 'mixed startup did not diagnose both the renamed and missing repository');
+  }
+  else finish(0, scenario === 'mixed'
+    ? 'built server initialized, delivered rename/unavailable events, served healthy and renamed reads, refused missing repo, and exited 0'
+    : 'the built server answered initialize over --stdio and exited 0');
 });
 
 child.stdin.on("error", () => {});

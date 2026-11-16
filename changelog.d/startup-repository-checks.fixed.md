@@ -1,3 +1,3 @@
-- Check contributor-mode repositories with bounded concurrency before serving,
-  avoiding slow initialization for long `GITHUB_REPOS` lists. On a fatal check,
-  cancel later checks and report the first failing entry in list order.
+Startup repository verification runs with at most eight checks in flight,
+avoiding slow initialization for long `GITHUB_REPOS` lists. Unavailable entries
+are now set aside independently instead of cancelling siblings or failing startup.

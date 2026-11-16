@@ -122,6 +122,11 @@ const RENDER_TABLE: Array<{ kind: NormalizedEvent['kind']; event?: Partial<Norma
       },
     },
   },
+  { kind: 'installation.unavailable', event: { body: 'installation denied', thread: undefined } },
+  { kind: 'installation.available', event: { body: 'installation recovered', thread: undefined } },
+  { kind: 'repo.unavailable', event: { body: 'not found or inaccessible', thread: undefined } },
+  { kind: 'repo.renamed', event: { body: 'old/repo resolves to new/repo', thread: undefined } },
+  { kind: 'repo.available', event: { body: 'available again', thread: undefined } },
   { kind: 'push', event: { sha: 'd'.repeat(40) } },
   { kind: 'thread.read_failed', event: { body: 'github-mcpl stopped reading this thread.' } },
 ];

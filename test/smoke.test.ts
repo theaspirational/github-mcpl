@@ -91,7 +91,7 @@ test('FakeGitHubApi replies in a review thread and resolves it', async () => {
   const thread = api.seedReviewThread(pull, { comments: [{ id: 555, author: { login: 'human-one', isBot: false }, body: 'why?', createdAt: '2026-10-01T00:00:00.000Z' }] });
 
   await api.replyToReviewComment(pull, 555, 'because of the base ref');
-  await api.resolveReviewThread(thread.id);
+  await api.resolveReviewThread(pull, thread.id);
 
   const threads = await api.listReviewThreads(pull);
   assert.equal(threads[0].comments.length, 2);

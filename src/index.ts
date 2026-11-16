@@ -17,9 +17,10 @@
 
 import * as net from 'node:net';
 import { McplConnection } from '@animalabs/mcpl-core';
-import { GitHubAdapter } from './github-adapter.js';
+import { GitHubAdapter, type GitHubAdapterOptions } from './github-adapter.js';
 import { CheckGate } from './normalize.js';
 import { NotificationsPoller } from './notifications-poller.js';
+import { RepoAvailability } from './repo-availability.js';
 import { Poller } from './poller.js';
 import { GitHubMcplServer } from './server.js';
 import { GithubState } from './state.js';
@@ -53,6 +54,7 @@ interface Running {
   poller: Poller | null;
   notifications: NotificationsPoller | null;
   state: GithubState;
+  availability: RepoAvailability;
 }
 
 /**
@@ -67,9 +69,9 @@ interface Running {
  * registration output deserves better than that. The original message is kept
  * after the colon; it carries no key material, only a decoder verdict.
  */
-function buildAdapter(config: Config, log: Logger): GitHubAdapter {
+function buildAdapter(config: Config, log: Logger, onRepositoryResolved: GitHubAdapterOptions['onRepositoryResolved']): GitHubAdapter {
   try {
-    return new GitHubAdapter(config, { logger: log });
+    return new GitHubAdapter(config, { logger: log, onRepositoryResolved });
   } catch (err) {
     if (config.authMode === 'token') {
       log.error(`contributor-mode adapter failed to start: ${(err as Error).message}`);
@@ -92,15 +94,20 @@ function buildAdapter(config: Config, log: Logger): GitHubAdapter {
  * pass for the same head would each emit their own event.
  */
 async function build(config: Config, log: Logger): Promise<{ server: GitHubMcplServer; running: Running }> {
-  const api = buildAdapter(config, log);
-  // Contributor mode checks the token and the repositories before anything
-  // else, and takes GITHUB_BOT_LOGIN from the token when it is unset.
+  const adapter = buildAdapter(config, log, (repo, name) => availability.confirm(repo, name));
+  const availability: RepoAvailability = new RepoAvailability(
+    config.repos,
+    (repo) => adapter.getRepositoryName(repo),
+    async (event) => { await server.onEvent(event); },
+    log,
+  );
+  const api = availability.guard(adapter);
+  // Contributor identity errors remain fatal; repository failures below do not.
+  // Take GITHUB_BOT_LOGIN from the token when it is unset.
   if (config.authMode === 'token') {
-    const login = await api.checkTokenLogin(config.botLogin);
-    const problems = [login.problem, ...(await api.repoSpellingProblems(config.repos))];
-    const found = problems.filter((p): p is string => p !== null);
-    if (found.length > 0) {
-      for (const problem of found) log.error(problem);
+    const login = await adapter.checkTokenLogin(config.botLogin);
+    if (login.problem) {
+      log.error(login.problem);
       process.exit(1);
     }
     if (!config.botLogin) log.info('GITHUB_BOT_LOGIN is unset, so it is the token\'s login', { login: login.login });
@@ -108,6 +115,8 @@ async function build(config: Config, log: Logger): Promise<{ server: GitHubMcplS
   }
   const state = GithubState.load(config.stateFile, log);
   const server = new GitHubMcplServer(api, {
+    assertRepoAvailable: (repo) => availability.assertAvailable(repo),
+    repoAvailable: (repo) => availability.available(repo),
     botLogin: config.botLogin,
     repos: config.repos,
     maintainers: config.maintainers,
@@ -118,12 +127,15 @@ async function build(config: Config, log: Logger): Promise<{ server: GitHubMcplS
     logger: log,
   });
   registerTools(server);
+  await availability.initialize();
+  availability.start();
 
   // Contributor mode has one ingress, the notifications poller, and no
   // webhook (readConfig already refused GITHUB_WEBHOOK_PORT in this mode).
   if (config.authMode === 'token') {
     const notifications = new NotificationsPoller({
       api,
+      repoAvailable: (repo) => availability.available(repo),
       state,
       intervalMs: config.pollIntervalMs,
       repos: config.repos,
@@ -135,7 +147,7 @@ async function build(config: Config, log: Logger): Promise<{ server: GitHubMcplS
     });
     notifications.start();
     log.info('polling notifications', { intervalMs: config.pollIntervalMs });
-    return { server, running: { webhook: null, poller: null, notifications, state } };
+    return { server, running: { webhook: null, poller: null, notifications, state, availability } };
   }
 
   const checkGate = new CheckGate();
@@ -155,6 +167,7 @@ async function build(config: Config, log: Logger): Promise<{ server: GitHubMcplS
       ? null
       : new Poller({
           api,
+          repoAvailable: (repo) => availability.available(repo),
           repos: config.repos,
           state,
           intervalMs: config.pollIntervalMs,
@@ -168,7 +181,7 @@ async function build(config: Config, log: Logger): Promise<{ server: GitHubMcplS
     log.info('polling', { intervalMs: config.pollIntervalMs });
   }
 
-  return { server, running: { webhook, poller, notifications: null, state } };
+  return { server, running: { webhook, poller, notifications: null, state, availability } };
 }
 
 /**
@@ -178,6 +191,7 @@ async function build(config: Config, log: Logger): Promise<{ server: GitHubMcplS
 async function shutdown(running: Running, log: Logger): Promise<void> {
   running.poller?.stop();
   running.notifications?.stop();
+  await running.availability.stop();
   try {
     await running.poller?.whenIdle();
     await running.notifications?.whenIdle();
