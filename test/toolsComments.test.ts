@@ -1,13 +1,3 @@
-/**
- * tools-comments.ts — the `github.comments` tools and `state/rollback`
- * (TASK-SRHKG.1.7).
- *
- * Everything runs against `FakeGitHubApi` and an in-memory {@link GithubState};
- * no octokit, no network. The tests drive the tools the way .9's routing will:
- * a tool call, then a checkpoint, so the checkpoint names the state *including*
- * that write (SPEC §8.2).
- */
-
 import { strict as assert } from 'node:assert';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -73,7 +63,6 @@ function text(result: ToolResult): string {
   return result.content.map((block) => (block as TextContent).text ?? '').join('\n');
 }
 
-/** One tool call the way .9 routes it: call, then checkpoint the new state. */
 async function call(f: Fixture, name: string, args: Record<string, unknown>): Promise<ToolResult> {
   const result = await commentsToolModule.call(name, args, f.ctx);
   f.state.createCheckpoint();
@@ -83,10 +72,6 @@ async function call(f: Fixture, name: string, args: Record<string, unknown>): Pr
 function bodies(api: FakeGitHubApi, thread: ThreadRef): Promise<string[]> {
   return api.listComments(thread).then((list) => list.map((c) => c.body));
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// The module surface
-// ─────────────────────────────────────────────────────────────────────────────
 
 test('the module declares exactly the contract\'s github.comments tools', () => {
   assert.equal(commentsToolModule.featureSet, COMMENTS_FEATURE_SET);
@@ -106,10 +91,6 @@ test('an unknown tool name is refused, not thrown', async () => {
   assert.equal(result.isError, true);
   assert.match(text(result), /unknown tool/);
 });
-
-// ─────────────────────────────────────────────────────────────────────────────
-// comment / reply_in_thread
-// ─────────────────────────────────────────────────────────────────────────────
 
 test('comment posts and books the new comment under the current checkpoint', async () => {
   const f = fixture();
@@ -186,10 +167,6 @@ test('reply_in_thread replies into a review conversation and books it as a revie
   assert.match(text(badId), /expected a review conversation/);
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// edit_own_comment / delete_own_comment
-// ─────────────────────────────────────────────────────────────────────────────
-
 test('edit_own_comment rewrites the bot\'s comment and books the previous body', async () => {
   const f = fixture();
   f.api.seedIssue({ number: 7 });
@@ -258,8 +235,6 @@ test('delete_own_comment deletes the bot\'s comment and books an undeletable rec
   assert.equal(f.api.callsTo('deleteComment').length, 0);
   assert.deepEqual(f.state.snapshot().deleted, {});
 
-  // The refused call already checkpointed (as .9's routing does for any call),
-  // so the delete books under the checkpoint current at that moment.
   const current = f.state.current();
   assert.notEqual(current, base.id);
   const result = await call(f, TOOL_DELETE_OWN_COMMENT, { thread: 7, commentId: own.id });
@@ -270,15 +245,10 @@ test('delete_own_comment deletes the bot\'s comment and books an undeletable rec
   ]);
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// upsert_sticky_comment
-// ─────────────────────────────────────────────────────────────────────────────
-
 test('the sticky marker is an HTML comment, however it was passed', () => {
   assert.equal(stickyMarker('ci-status'), '<!-- ci-status -->');
   assert.equal(stickyMarker('<!-- ci-status -->'), '<!-- ci-status -->');
   assert.equal(stickyBody('ci-status', 'green'), '<!-- ci-status -->\ngreen');
-  // A body that already carries the marker keeps it where the caller put it.
   assert.equal(stickyBody('ci-status', 'green\n<!-- ci-status -->'), 'green\n<!-- ci-status -->');
 });
 
@@ -305,7 +275,6 @@ test('upsert_sticky_comment creates once, then edits in place, keeping the marke
   assert.equal(f.api.callsTo('updateComment').length, 1);
   assert.match(text(second), /updated sticky <!-- ci-status -->/);
 
-  // A different marker is a different sticky comment.
   const other = await call(f, TOOL_UPSERT_STICKY_COMMENT, { thread: 7, marker: 'plan', body: 'the plan' });
   assert.notEqual(other.isError, true);
   assert.equal((await f.api.listComments(ISSUE)).length, 3);
@@ -323,10 +292,6 @@ test('upsert_sticky_comment never edits a marker-carrying comment written by som
   assert.equal(comments[0].body, '<!-- ci-status -->\nimpersonation');
   assert.equal(f.api.callsTo('updateComment').length, 0);
 });
-
-// ─────────────────────────────────────────────────────────────────────────────
-// state/rollback (SPEC §8.5, §8.6)
-// ─────────────────────────────────────────────────────────────────────────────
 
 test('rollback after two comments and one edit deletes two and restores one', async () => {
   const f = fixture();
@@ -346,7 +311,6 @@ test('rollback after two comments and one edit deletes two and restores one', as
   assert.equal(result.success, true);
   assert.equal(result.checkpoint, base.id);
   assert.equal(result.reason, undefined);
-  // Newest action first: the second comment, the first comment, then the body.
   assert.deepEqual(
     result.undone.map((i) => [i.action, i.commentId]),
     [
@@ -368,7 +332,6 @@ test('rollback across a comment someone else removed reports what it could not u
   await call(f, TOOL_COMMENT, { thread: 7, body: 'first' });
   await call(f, TOOL_COMMENT, { thread: 7, body: 'second' });
 
-  // A maintainer deletes one of them out of band, outside these tools.
   const gone = (await f.api.listComments(ISSUE))[0];
   await f.api.deleteComment(TEST_REPO, gone.id);
 
@@ -398,8 +361,6 @@ test('rollback reports a delete it can never undo, and skips an edit of a commen
 
   const result = await rollbackComments({ featureSet: COMMENTS_FEATURE_SET, checkpoint: base.id }, f.ctx);
   assert.equal(result.success, false);
-  // The create is undone by the delete; the edit of that same comment needs no
-  // restore, so it is neither undone nor reported as a failure.
   assert.deepEqual(
     result.undone.map((i) => [i.action, i.commentId]),
     [['delete', created.id]],
@@ -411,8 +372,6 @@ test('rollback reports a delete it can never undo, and skips an edit of a commen
   assert.match(result.notUndone[0].reason ?? '', /GitHub cannot restore a deleted comment/);
   assert.deepEqual(await bodies(f.api, ISSUE), []);
 
-  // The delete stays booked: this checkpoint can never be fully restored, and
-  // a retry keeps saying so rather than reporting an empty success.
   const retry = await rollbackComments({ featureSet: COMMENTS_FEATURE_SET, checkpoint: base.id }, f.ctx);
   assert.equal(retry.success, false);
   assert.deepEqual(retry.undone, []);
@@ -457,15 +416,12 @@ test('rollback survives a restart: the bookkeeping is on the state file', async 
   await call(first, TOOL_EDIT_OWN_COMMENT, { thread: 7, commentId: own.id, body: 'edited before the restart' });
   const createdId = (await api.listComments(ISSUE))[1].id;
 
-  // A restart: a new store over the same file, the same GitHub behind it.
   const restarted = GithubState.load(file);
   assert.deepEqual(restarted.lineage().map((c) => c.id).slice(0, 1), [base.id]);
   const ctx: ToolContext = { ...first.ctx, state: restarted };
 
   const result = await rollbackComments({ featureSet: COMMENTS_FEATURE_SET, checkpoint: base.id }, ctx);
   assert.equal(result.success, true);
-  // Deletes run before restores: a create and an edit of the same comment
-  // cannot then fight over it.
   assert.deepEqual(
     result.undone.map((i) => [i.action, i.commentId]),
     [
@@ -474,7 +430,6 @@ test('rollback survives a restart: the bookkeeping is on the state file', async 
     ],
   );
   assert.deepEqual(await bodies(api, ISSUE), ['original body']);
-  // The rollback itself is flushed, so a second restart does not redo it.
   assert.deepEqual(GithubState.load(file).rollback(base.id), { created: [], edited: [], deleted: [] });
 });
 
@@ -484,7 +439,6 @@ test('recordCreated and recordEdited are the entry points .5 shares with these t
   const own = f.api.seedComment(ISSUE, { body: 'original body', author: { login: TEST_BOT.login, isBot: true } });
   const base = f.state.createCheckpoint();
 
-  // What .5's publish does: write through the api, then book it here.
   const published = await f.api.createComment(ISSUE, 'published through a channel');
   await recordCreated(published, ISSUE, false, f.ctx);
   await f.api.updateComment(TEST_REPO, own.id, 'rewritten through a channel');
@@ -511,10 +465,6 @@ test('a write outside the allow-list never reaches the api or the state', async 
   assert.equal(f.state.snapshot().created[base.id], undefined);
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Review round 1 — the four findings
-// ─────────────────────────────────────────────────────────────────────────────
-
 test('rollback refuses to touch a repository outside the allow-list, and keeps the record', async () => {
   const f = fixture();
   f.api.seedIssue({ number: 7 });
@@ -523,9 +473,6 @@ test('rollback refuses to touch a repository outside the allow-list, and keeps t
   const created = (await f.api.listComments(ISSUE))[0];
   f.api.clearCalls();
 
-  // The same state, replayed under a context that no longer allows the
-  // repository the record names (a configuration change, or a stale state
-  // file). Rollback is a write like any other: the allow-list binds it.
   const narrowed: ToolContext = { ...f.ctx, repos: [OTHER_REPO] };
   const refused = await rollbackComments({ featureSet: COMMENTS_FEATURE_SET, checkpoint: base.id }, narrowed);
   assert.equal(refused.success, false);
@@ -537,8 +484,6 @@ test('rollback refuses to touch a repository outside the allow-list, and keeps t
   assert.deepEqual(f.api.callLog(), [], 'no api call is made for a refused repository');
   assert.deepEqual(await bodies(f.api, ISSUE), ['written while rayforce was allowed']);
 
-  // The record survived the refusal, so a correctly configured retry still
-  // undoes it: a refusal is not a silent discard.
   const retry = await rollbackComments({ featureSet: COMMENTS_FEATURE_SET, checkpoint: base.id }, f.ctx);
   assert.equal(retry.success, true);
   assert.deepEqual(retry.undone.map((i) => i.commentId), [created.id]);
@@ -559,8 +504,6 @@ test('a checkpoint abandoned by an earlier rollback raises -32005 instead of rep
   assert.equal(toA.success, true);
   assert.deepEqual(await bodies(f.api, ISSUE), ['A']);
 
-  // A new write branches from A; B's branch is gone, and with it any way back
-  // to the state B named.
   await call(f, TOOL_EDIT_OWN_COMMENT, { thread: 7, commentId: own.id, body: 'C' });
   assert.deepEqual(await bodies(f.api, ISSUE), ['C']);
 
@@ -577,7 +520,6 @@ test('a checkpoint abandoned by an earlier rollback raises -32005 instead of rep
     },
   );
   assert.deepEqual(await bodies(f.api, ISSUE), ['C'], 'nothing was touched by the refused rollback');
-  // Rolling back to A, which is still the current lineage, keeps working.
   const again = await rollbackComments({ featureSet: COMMENTS_FEATURE_SET, checkpoint: a.id }, f.ctx);
   assert.equal(again.success, true);
   assert.deepEqual(await bodies(f.api, ISSUE), ['A']);
@@ -587,11 +529,8 @@ test('an issue comment and a review comment sharing an id are two different comm
   const f = fixture();
   f.api.seedIssue({ number: 7 });
   f.api.seedPullRequest({ number: 8 });
-  // GitHub numbers issue comments and review comments from different
-  // sequences, so one id can name both. (FakeGitHubApi's updateComment and
-  // deleteComment ignore the `review` flag when they pick a target — the
-  // assertions below are on the calls the module makes, not on the fake's
-  // choice of victim.)
+  // GitHub numbers issue comments and review comments from separate
+  // sequences, so one id can name both.
   const shared = 500;
   const issueComment = f.api.seedComment(ISSUE, {
     id: shared,
@@ -616,8 +555,6 @@ test('an issue comment and a review comment sharing an id are two different comm
 
   const result = await rollbackComments({ featureSet: COMMENTS_FEATURE_SET, checkpoint: base.id }, f.ctx);
   assert.equal(result.success, true);
-  // Both actions run: deleting the issue comment must not swallow the restore
-  // of the review comment that happens to carry the same number.
   assert.deepEqual(f.api.callsTo('deleteComment')[0].args, [TEST_REPO, shared, false]);
   assert.deepEqual(f.api.callsTo('updateComment')[0].args, [TEST_REPO, shared, 'original review body', true]);
   assert.deepEqual(
@@ -638,7 +575,6 @@ test('a transient failure keeps its record, so a retry cannot claim a completed 
   await call(f, TOOL_EDIT_OWN_COMMENT, { thread: 7, commentId: own.id, body: 'edited' });
   const created = (await f.api.listComments(ISSUE))[1];
 
-  // GitHub is briefly unavailable for both undo calls.
   const realDelete = f.api.deleteComment.bind(f.api);
   const realUpdate = f.api.updateComment.bind(f.api);
   let failures = 2;
@@ -663,8 +599,6 @@ test('a transient failure keeps its record, so a retry cannot claim a completed 
   );
   assert.deepEqual(await bodies(f.api, ISSUE), ['edited', 'created']);
 
-  // Both records are still booked under the checkpoint, so the retry (GitHub
-  // is back) finishes the job instead of reporting an empty success.
   const snapshot = f.state.snapshot();
   assert.deepEqual(snapshot.created[base.id].map((c) => c.commentId), [created.id]);
   assert.deepEqual(snapshot.edited[base.id].map((e) => e.previousBody), ['original body']);
@@ -681,11 +615,6 @@ test('a transient failure keeps its record, so a retry cannot claim a completed 
   assert.deepEqual(await bodies(f.api, ISSUE), ['original body']);
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Review round 2 — the two findings
-// ─────────────────────────────────────────────────────────────────────────────
-
-/** Three edits of one comment: A → B → C → D, with the checkpoint at A. */
 async function threeEdits(f: Fixture): Promise<{ base: string; own: number }> {
   f.api.seedIssue({ number: 7 });
   const own = f.api.seedComment(ISSUE, { body: 'A', author: { login: TEST_BOT.login, isBot: true } });
@@ -709,15 +638,12 @@ test('rollback restores the body the checkpoint named, never an intermediate one
     result.undone.map((i) => [i.action, i.commentId]),
     [['restore', own]],
   );
-  // One update, carrying the oldest body in the range: B and C are states the
-  // rollback has no reason to pass through.
   assert.deepEqual(
     f.api.callsTo('updateComment').map((c) => c.args[2]),
     ['A'],
   );
   assert.deepEqual(await bodies(f.api, ISSUE), ['A']);
 
-  // Nothing is left pending, so a retry is a no-op rather than a second write.
   assert.deepEqual(f.state.snapshot().edited, {});
   f.api.clearCalls();
   const retry = await rollbackComments({ featureSet: COMMENTS_FEATURE_SET, checkpoint: base }, f.ctx);
@@ -731,7 +657,6 @@ test('a failed restore retains only the oldest body, and the retry lands on it',
   const f = fixture();
   const { base, own } = await threeEdits(f);
 
-  // GitHub refuses the first restore attempt.
   const realUpdate = f.api.updateComment.bind(f.api);
   let failures = 1;
   f.api.updateComment = async (repo, commentId, body, review) => {
@@ -748,8 +673,6 @@ test('a failed restore retains only the oldest body, and the retry lands on it',
   );
   assert.deepEqual(await bodies(f.api, ISSUE), ['D'], 'the failed restore changed nothing');
 
-  // Exactly one record is retained, and it is the oldest body — retaining the
-  // superseded ones would let a retry put B back over a restored A.
   const pending = f.state.snapshot().edited[base];
   assert.equal(pending.length, 1);
   assert.equal(pending[0].previousBody, 'A');
@@ -761,8 +684,6 @@ test('a failed restore retains only the oldest body, and the retry lands on it',
     [['restore', own]],
   );
   assert.deepEqual(await bodies(f.api, ISSUE), ['A']);
-  // Across both runs the only body ever written back is the one at the
-  // checkpoint; the comment never visits B or C.
   assert.deepEqual([...new Set(f.api.callsTo('updateComment').map((c) => c.args[2]))], ['A']);
 
   const again = await rollbackComments({ featureSet: COMMENTS_FEATURE_SET, checkpoint: base }, f.ctx);
@@ -772,14 +693,8 @@ test('a failed restore retains only the oldest body, and the retry lands on it',
 });
 
 /**
- * A pull request carrying one issue comment and one review comment that share
- * id 500 — two different comments, numbered by two different endpoints.
- *
- * (`FakeGitHubApi.updateComment`/`deleteComment` ignore the `review` flag when
- * they pick a target and always scan the issue comments first, so the
- * assertions below are on the arguments the module passes and on the body it
- * read, not on which of the two the fake then mutated. Fresh fixtures keep
- * that from leaking between cases.)
+ * GitHub numbers issue comments and review comments separately, so a pull
+ * request can carry one of each with the same id.
  */
 function colliding(): { f: Fixture; shared: number } {
   const f = fixture();
@@ -847,7 +762,6 @@ test('edit_own_comment refuses a colliding id until the caller names the endpoin
   assert.equal(badFlag.isError, true);
   assert.match(text(badFlag), /^review: true for a review comment/);
 
-  // review: true takes the review-conversation comment and its REST path.
   const reviewCase = colliding();
   const reviewCp = reviewCase.f.state.createCheckpoint();
   const edited = await call(reviewCase.f, TOOL_EDIT_OWN_COMMENT, {
@@ -873,7 +787,6 @@ test('edit_own_comment refuses a colliding id until the caller names the endpoin
     },
   ]);
 
-  // review: false takes the top-level comment, on the issue-comments path.
   const issueCase = colliding();
   const issueCp = issueCase.f.state.createCheckpoint();
   const issueEdited = await call(issueCase.f, TOOL_EDIT_OWN_COMMENT, {

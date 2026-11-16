@@ -1,15 +1,3 @@
-/**
- * Fixture → NormalizedEvent (TASK-SRHKG.1.3).
- *
- * Every file in test/fixtures/ is a hand-written payload shaped like GitHub's
- * documented webhook JSON — `octocat`/`hubot` placeholders, invented ids, no
- * real text and no secret material. The table below is the documentation of
- * the mapping: one row per fixture, naming the kind and every field the
- * acceptance criteria call for (thread, actor, sha, review, reviewComment,
- * checks). A fixture with no row fails the "every fixture is covered" test,
- * so a new payload cannot be added without saying what it normalizes to.
- */
-
 import { strict as assert } from 'node:assert';
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -51,7 +39,6 @@ const HEAD = '4d7b2e8c1a93f05627de4b1c8a0f3927e5c6d418';
 const FIRST_HEAD = '1f0c9a4d2b7e55c3a81d6e40b9f27c3d5a8e1b02';
 const DEV_SHA = '9ab3c1d7e5f20418b6c93d7a2e1f08c4d6b5a397';
 
-/** `issue_comment.created.on_pull.json` → the `issue_comment` event. */
 function eventNameOf(fixture: string): string {
   return fixture.split('.', 1)[0];
 }
@@ -68,11 +55,8 @@ function load(fixture: string): WebhookDelivery {
 const ISSUE_41: ThreadRef = { repo: TEST_REPO, number: 41, kind: 'issue' };
 const PULL_58: ThreadRef = { repo: TEST_REPO, number: 58, kind: 'pull' };
 
-/** What each fixture must normalize to. `events: []` means "dropped". */
 interface Expectation {
-  /** One entry per event the delivery produces, in order. */
   events: Partial<NormalizedEvent>[];
-  /** Set when the fixture is deliberately not for the allow-listed repo. */
   foreignRepo?: boolean;
 }
 
@@ -106,8 +90,6 @@ const EXPECTED: Record<string, Expectation> = {
         actor: { login: 'hubot', isBot: false },
         body: '@rayforce-clone[bot] can you reproduce this on dev?',
         html_url: 'https://github.com/anima-research/rayforce/issues/41#issuecomment-2200000007',
-        // Amendment 2b: a top-level comment carries its own id, so the
-        // turn-order rule can place it in the thread.
         comment: { id: 2200000007 },
       },
     ],
@@ -167,7 +149,7 @@ const EXPECTED: Record<string, Expectation> = {
         kind: 'review.submitted',
         thread: PULL_58,
         actor: { login: 'octocat', isBot: false },
-        // The commit reviewed, not the PR's current head (which is HEAD).
+        // The commit reviewed, not the pull request's current head.
         sha: FIRST_HEAD,
         review: { id: 2400000044, state: 'approved' },
       },
@@ -214,7 +196,6 @@ const EXPECTED: Record<string, Expectation> = {
     events: [
       {
         kind: 'checks.completed',
-        // The suite's head sha is the head of PR 58, so the event is threaded.
         thread: PULL_58,
         actor: { login: 'rayforce-clone[bot]', isBot: true },
         sha: HEAD,
@@ -227,8 +208,6 @@ const EXPECTED: Record<string, Expectation> = {
       {
         kind: 'checks.completed',
         thread: PULL_58,
-        // A second *failing* workflow on the same commit: the one whose jobs
-        // were being swallowed by the sha dedup (review round 2, finding 2).
         sha: HEAD,
         checks: { conclusion: 'failure', failed: [] },
       },
@@ -239,8 +218,6 @@ const EXPECTED: Record<string, Expectation> = {
       {
         kind: 'checks.completed',
         thread: PULL_58,
-        // A second workflow on the same commit: same head sha as
-        // check_suite.completed.json, different suite and delivery.
         sha: HEAD,
         checks: { conclusion: 'success', failed: [] },
       },
@@ -264,8 +241,6 @@ const EXPECTED: Record<string, Expectation> = {
         kind: 'checks.completed',
         thread: PULL_58,
         sha: HEAD,
-        // The run that just failed is pre-listed; resolveCheckEvents replaces it
-        // with every failure on the sha.
         checks: {
           conclusion: 'failure',
           failed: [{ name: 'test (ubuntu-latest)', url: 'https://github.com/anima-research/rayforce/runs/2700001234' }],
@@ -285,7 +260,7 @@ const EXPECTED: Record<string, Expectation> = {
       },
     ],
   },
-  // GitHub's reachability check: webhook.ts answers it, nothing is emitted.
+  // GitHub's ping checks the webhook's reachability; it carries no event.
   'ping.json': { events: [] },
   'issues.opened.foreign_repo.json': {
     events: [{ kind: 'issue.opened', thread: { repo: { owner: 'other-org', name: 'other-repo' }, number: 3, kind: 'issue' } }],
@@ -319,13 +294,11 @@ for (const fixture of fixtureFiles()) {
           `${fixture} event ${i}: field ${field}`,
         );
       }
-      // Fields every event carries, whatever the fixture.
       assert.equal(event.id, delivery.id);
       assert.equal(event.receivedAt, RECEIVED_AT);
       assert.ok(event.html_url.startsWith('https://github.com/'), 'html_url is a github URL');
       assert.ok(event.actor.login.length > 0, 'actor has a login');
       if (!expectation.foreignRepo) assert.deepEqual(event.repo, TEST_REPO);
-      // The contract keeps `raw` on the event (and nothing downstream reads it).
       assert.equal(event.raw, delivery.payload);
     });
   });
@@ -333,13 +306,9 @@ for (const fixture of fixtureFiles()) {
 
 test('an unhandled event or action is dropped rather than guessed at', () => {
   const payload = JSON.parse(readFileSync(join(FIXTURES, 'issues.opened.json'), 'utf8'));
-  // An action with no kind in the contract.
   assert.deepEqual(normalizeWebhook({ ...load('issues.opened.json'), payload: { ...payload, action: 'labeled' } }), []);
-  // An event with no mapping at all.
   assert.deepEqual(normalizeWebhook({ ...load('issues.opened.json'), event: 'installation_repositories' }), []);
-  // A payload with no repository cannot be placed.
   assert.deepEqual(normalizeWebhook({ ...load('issues.opened.json'), payload: { action: 'opened' } }), []);
-  // Nothing throws on junk.
   assert.deepEqual(normalizeWebhook({ ...load('issues.opened.json'), payload: 42 }), []);
   assert.deepEqual(normalizeWebhook({ ...load('issues.opened.json'), payload: null }), []);
 });
@@ -374,7 +343,6 @@ test('actor and repo extraction', () => {
   assert.deepEqual(actorFrom({ login: 'some-app', type: 'Bot' }), { login: 'some-app', isBot: true });
   assert.equal(actorFrom({}), undefined);
   assert.deepEqual(repoFrom({ repository: { full_name: 'anima-research/rayforce' } }), TEST_REPO);
-  // No full_name: owner.login + name is the fallback.
   assert.deepEqual(repoFrom({ repository: { owner: { login: 'a' }, name: 'b' } }), { owner: 'a', name: 'b' });
   assert.equal(repoFrom({ repository: { full_name: 'not-a-slug' } }), undefined);
 });
@@ -384,10 +352,6 @@ test('threadKindFromUrl tells an issue comment on a PR from one on an issue', ()
   assert.equal(threadKindFromUrl('https://github.com/a/b/issues/7#issuecomment-1'), 'issue');
   assert.equal(threadKindFromUrl(undefined), 'issue');
 });
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Poll rows (contract amendment 1)
-// ─────────────────────────────────────────────────────────────────────────────
 
 const POLLED_ISSUE: PolledIssue = {
   id: 2100000001,
@@ -402,7 +366,6 @@ const POLLED_ISSUE: PolledIssue = {
   html_url: 'https://github.com/anima-research/rayforce/issues/41',
 };
 
-/** The cursor the poll pass queried with, after POLLED_ISSUE was created. */
 const SINCE = '2026-10-13T08:00:00.000Z';
 
 test('poll ids and dedup keys have the documented shape', () => {
@@ -413,7 +376,8 @@ test('poll ids and dedup keys have the documented shape', () => {
 test('a polled issue row normalizes by state, and an edit keeps issue.edited', () => {
   const open = normalizePolledIssue(TEST_REPO, POLLED_ISSUE, RECEIVED_AT, SINCE);
   assert.ok(open);
-  // Created before the cursor: a poll cannot say which field changed.
+  // Created before the cursor: GitHub's list gives updated_at, not which
+  // field changed.
   assert.equal(open.kind, 'issue.edited');
   assert.equal(open.id, 'poll:issue:2100000001:2026-10-13T09:00:00Z');
   assert.deepEqual(open.thread, ISSUE_41);
@@ -426,35 +390,28 @@ test('a polled issue row normalizes by state, and an edit keeps issue.edited', (
   assert.equal(closed.kind, 'issue.closed');
 });
 
-// ── Amendment 2a: created_at against the cursor ──
-
 test('an issue created at or after the cursor is issue.opened (amendment 2a)', () => {
   const after = normalizePolledIssue(TEST_REPO, { ...POLLED_ISSUE, createdAt: '2026-10-13T08:30:00Z' }, RECEIVED_AT, SINCE);
   assert.ok(after);
   assert.equal(after.kind, 'issue.opened');
 
-  // The boundary is inclusive: created exactly at the cursor is still new,
-  // because `since` is the instant the previous pass ran *at*.
   const exactly = normalizePolledIssue(TEST_REPO, { ...POLLED_ISSUE, createdAt: SINCE }, RECEIVED_AT, SINCE);
   assert.ok(exactly);
   assert.equal(exactly.kind, 'issue.opened');
 
-  // One millisecond before it is not.
   const before = normalizePolledIssue(TEST_REPO, { ...POLLED_ISSUE, createdAt: '2026-10-13T07:59:59.999Z' }, RECEIVED_AT, SINCE);
   assert.ok(before);
   assert.equal(before.kind, 'issue.edited');
 });
 
 test('created_at is compared as an instant, not as a string (amendment 2a)', () => {
-  // The regression a string compare produces: GitHub stamps the row without
-  // milliseconds, the cursor carries them, and `'Z'` > `'.'` lexicographically.
-  // 12:00:00Z is *before* 12:00:00.500Z and must read as an edit.
+  // GitHub stamps a row without milliseconds while the cursor carries them,
+  // and 'Z' sorts after '.', so 12:00:00Z must compare before 12:00:00.500Z.
   const row = { ...POLLED_ISSUE, createdAt: '2026-10-13T12:00:00Z' };
   const edited = normalizePolledIssue(TEST_REPO, row, RECEIVED_AT, '2026-10-13T12:00:00.500Z');
   assert.ok(edited);
   assert.equal(edited.kind, 'issue.edited');
 
-  // And an unparseable stamp falls back to the pre-amendment kind.
   const unparseable = normalizePolledIssue(TEST_REPO, { ...POLLED_ISSUE, createdAt: '' }, RECEIVED_AT, SINCE);
   assert.ok(unparseable);
   assert.equal(unparseable.kind, 'issue.edited');
@@ -475,7 +432,6 @@ test('a polled pull-request row normalizes by state and keeps the head sha', () 
   assert.deepEqual(open.thread, PULL_58);
   assert.equal(open.sha, HEAD);
 
-  // Closed stays closed however old it is.
   const closed = normalizePolledIssue(TEST_REPO, { ...row, state: 'closed', createdAt: '2026-10-01T00:00:00Z' }, RECEIVED_AT, SINCE);
   assert.ok(closed);
   assert.equal(closed.kind, 'pull.closed');
@@ -491,17 +447,14 @@ test('an open pull-request row seen again is synchronize on a new head, and drop
     createdAt: '2026-10-12T08:00:00Z',
   };
 
-  // Head moved since the last pass recorded it: new commits.
   const moved = normalizePolledIssue(TEST_REPO, row, RECEIVED_AT, SINCE, 'a'.repeat(40));
   assert.ok(moved);
   assert.equal(moved.kind, 'pull.synchronize');
   assert.equal(moved.sha, HEAD);
 
-  // Same head: the row was touched by a comment, which the pass collects as
-  // its own row. Nothing to announce here.
+  // Same head: a comment bumped the row's updated_at.
   assert.equal(normalizePolledIssue(TEST_REPO, row, RECEIVED_AT, SINCE, HEAD), null);
 
-  // An unknown head cannot be shown to have moved, so it drops the same way.
   assert.equal(normalizePolledIssue(TEST_REPO, { ...row, headSha: undefined }, RECEIVED_AT, SINCE, HEAD), null);
   assert.equal(normalizePolledIssue(TEST_REPO, { ...row, headSha: '' }, RECEIVED_AT, SINCE, undefined), null);
 });
@@ -515,13 +468,10 @@ test('a polled top-level comment carries its own id, a review comment does not (
     updatedAt: '2026-10-13T09:00:00Z',
     html_url: 'https://github.com/anima-research/rayforce/issues/41#issuecomment-2200000031',
   };
-  // Amendment 2b places a comment in its thread's turn order, which needs its
-  // id; a `since` row has always carried one, it was just thrown away.
   assert.deepEqual(normalizePolledComment(TEST_REPO, top, 'issue_comment', RECEIVED_AT).comment, { id: 2200000031 });
 
-  // A review comment's id stays in `reviewComment` alone: the two endpoints
-  // number their comments separately and an id from one must never be read as
-  // an id from the other.
+  // GitHub numbers issue comments and review comments separately, so an id
+  // from one endpoint must never be read as an id from the other.
   const review = normalizePolledComment(TEST_REPO, { ...top, path: 'src/lib.rs' }, 'review_comment', RECEIVED_AT);
   assert.equal(review.comment, undefined);
   assert.equal(review.reviewComment?.id, 2200000031);
@@ -592,13 +542,8 @@ test('a polled check summary is keyed on the conclusion, not on a timestamp', ()
 test('isCompletedSummary is what stops a pending head becoming checks.completed', () => {
   const settled: ChecksSummary = { sha: HEAD, conclusion: 'success', total: 2, failed: [] };
   assert.equal(isCompletedSummary(settled), true);
-  // Runs exist but have not finished: `checks.completed` would be a lie.
   assert.equal(isCompletedSummary({ ...settled, conclusion: null }), false);
-  // No runs at all on the sha.
   assert.equal(isCompletedSummary({ sha: HEAD, conclusion: null, total: 0, failed: [] }), false);
-  // `normalizePolledChecks` only accepts the narrowed type, so the poller
-  // cannot build a pending event even by mistake — this is a type-level
-  // guarantee, asserted here through the guard that produces the narrowing.
   if (isCompletedSummary(settled)) {
     assert.match(
       normalizePolledChecks(TEST_REPO, PULL_58, settled, 'u', RECEIVED_AT).id,
@@ -606,10 +551,6 @@ test('isCompletedSummary is what stops a pending head becoming checks.completed'
     );
   }
 });
-
-// ─────────────────────────────────────────────────────────────────────────────
-// The checks lifecycle: marks, serialization, supersession
-// ─────────────────────────────────────────────────────────────────────────────
 
 function mark(rank: number, ...failed: string[]): CheckMark {
   return { rank, failed: [...new Set(failed)].sort() };
@@ -627,7 +568,6 @@ test('checkMarkOf reads a mark off a checks event and nothing off any other', ()
   const [green] = normalizeWebhook(load('check_suite.completed.second_suite.json'));
   assert.deepEqual(checkMarkOf(green), mark(RANK_SUCCESS));
   const [run] = normalizeWebhook(load('check_run.completed.json'));
-  // The run pre-lists itself as failed, so the mark names that job.
   assert.deepEqual(checkMarkOf(run), mark(RANK_FAILURE, 'test (ubuntu-latest)'));
   const [issue] = normalizeWebhook(load('issues.opened.json'));
   assert.equal(checkMarkOf(issue), null);
@@ -651,28 +591,19 @@ test('a mark names its failed jobs sorted and deduplicated, so it compares by se
 });
 
 test('coversMark is what decides dedup against supersession', () => {
-  // Identical: nothing new to say.
   assert.equal(coversMark(mark(RANK_FAILURE, 'lint'), mark(RANK_FAILURE, 'lint')), true);
-  // A stronger conclusion is news.
   assert.equal(coversMark(mark(RANK_SUCCESS), mark(RANK_FAILURE)), false);
-  // A weaker one is not: a second workflow finishing green says nothing new.
   assert.equal(coversMark(mark(RANK_FAILURE), mark(RANK_SUCCESS)), true);
   assert.equal(coversMark(mark(RANK_SKIPPED), mark(RANK_SUCCESS)), true);
   assert.equal(coversMark(mark(RANK_FAILURE), mark(RANK_CANCELLED)), true);
-  // A job the listener has not heard about is news, whatever the rank.
   assert.equal(coversMark(mark(RANK_FAILURE, 'lint'), mark(RANK_FAILURE, 'lint', 'test')), false);
   assert.equal(coversMark(mark(RANK_FAILURE), mark(RANK_FAILURE, 'lint')), false);
-  // A shorter view of the same failures is not.
   assert.equal(coversMark(mark(RANK_FAILURE, 'lint', 'test'), mark(RANK_FAILURE, 'lint')), true);
   assert.equal(coversMark(mark(RANK_FAILURE, 'lint', 'test'), mark(RANK_FAILURE)), true);
-  // "Nothing settled yet" is covered by anything at all.
   assert.equal(coversMark(mark(RANK_SUCCESS), mark(RANK_NONE)), true);
   assert.equal(coversMark(mark(RANK_NONE), mark(RANK_SUCCESS)), false);
 });
 
-// ── The gate: commit only after an accepted delivery ──
-
-/** Deliver `m` for `sha` through `gate`, recording the order of events. */
 async function emit(
   gate: CheckGate,
   sha: string,
@@ -701,7 +632,6 @@ test('a refused delivery commits nothing, so the next emission still delivers', 
   );
   assert.equal(gate.committedMark(TEST_REPO, HEAD), undefined, 'a refusal leaves no trace');
   assert.equal(gate.size, 0);
-  // The retry — or the other ingress path — gets to deliver it.
   assert.equal(await emit(gate, HEAD, mark(RANK_FAILURE, 'lint')), true);
   assert.deepEqual(gate.committedMark(TEST_REPO, HEAD), mark(RANK_FAILURE, 'lint'));
 });
@@ -717,7 +647,6 @@ test('the gate drops an emission the committed mark covers, without calling the 
   assert.equal(await emit(gate, HEAD, mark(RANK_FAILURE, 'lint'), deliver), false);
   assert.equal(await emit(gate, HEAD, mark(RANK_SUCCESS), deliver), false);
   assert.equal(called, 0, 'the listener is never told something it already has');
-  // A new job name, or a worse conclusion, still gets through.
   assert.equal(await emit(gate, HEAD, mark(RANK_FAILURE, 'lint', 'test', 'audit'), deliver), true);
   assert.equal(called, 1);
 });
@@ -726,9 +655,7 @@ test('a committed mark accumulates, so an older result cannot undo a newer one',
   const gate = new CheckGate();
   await emit(gate, HEAD, mark(RANK_FAILURE, 'test'));
   await emit(gate, HEAD, mark(RANK_FAILURE, 'lint'));
-  // The record is the union, not the last word.
   assert.deepEqual(gate.committedMark(TEST_REPO, HEAD), mark(RANK_FAILURE, 'lint', 'test'));
-  // And a success arriving late does not lower the conclusion.
   assert.equal(await emit(gate, HEAD, mark(RANK_SUCCESS)), false);
   assert.deepEqual(gate.committedMark(TEST_REPO, HEAD), mark(RANK_FAILURE, 'lint', 'test'));
 });
@@ -751,16 +678,12 @@ test('the gate forgets the oldest head sha past its capacity', async () => {
   assert.equal(gate.size, 3);
   await emit(gate, 'd', mark(RANK_SUCCESS));
   assert.equal(gate.size, 3);
-  // `a` was evicted, so it is news again; `d` is still remembered.
   assert.equal(gate.committedMark(TEST_REPO, 'a'), undefined);
   assert.deepEqual(gate.committedMark(TEST_REPO, 'd'), mark(RANK_SUCCESS));
-  // Being emitted again does not renew a sha's lease: `b` stays the oldest.
   await emit(gate, 'b', mark(RANK_FAILURE));
   await emit(gate, 'e', mark(RANK_SUCCESS));
   assert.equal(gate.committedMark(TEST_REPO, 'b'), undefined, 'b was evicted despite re-emitting');
 });
-
-// ── The gate: serialization ──
 
 test('two emissions for one head sha run one after another, never interleaved', async () => {
   const gate = new CheckGate();
@@ -775,7 +698,6 @@ test('two emissions for one head sha run one after another, never interleaved', 
     await firstHeld;
     trace.push('first out');
   });
-  // Queued behind the first, even though it was started while that one blocks.
   const second = emit(gate, HEAD, mark(RANK_FAILURE, 'lint', 'test'), async () => {
     trace.push('second in');
     trace.push('second out');
@@ -800,7 +722,6 @@ test('emissions for different head shas do not wait for each other', async () =>
   const first = emit(gate, HEAD, mark(RANK_FAILURE), async () => {
     await firstHeld;
   });
-  // A different sha, so it runs now rather than queueing.
   assert.equal(await emit(gate, DEV_SHA, mark(RANK_SUCCESS)), true);
   assert.equal(gate.inFlight, 1, 'only the blocked sha still has a queue');
   letFirstFinish?.();
@@ -808,8 +729,6 @@ test('emissions for different head shas do not wait for each other', async () =>
 });
 
 test('an emission queued behind a refused one still runs, and sees no mark', async () => {
-  // The round-3 regression in miniature: a refusal must not stall the queue
-  // behind it, and must not look to that queue like a delivery.
   const gate = new CheckGate();
   let letFirstFail: (() => void) | undefined;
   const firstHeld = new Promise<void>((resolve) => {
@@ -833,9 +752,6 @@ test('an emission queued behind a refused one still runs, and sees no mark', asy
 });
 
 test('a refusal cannot erase what a later accepted emission committed', async () => {
-  // Round-3 finding 2: A blocks on [lint], B delivers the fuller
-  // [lint, test] and is accepted, then A is refused. A never wrote anything,
-  // so B's record stands and the next identical delivery dedups.
   const gate = new CheckGate();
   let letAFail: (() => void) | undefined;
   const aHeld = new Promise<void>((resolve) => {
@@ -852,7 +768,6 @@ test('a refusal cannot erase what a later accepted emission committed', async ()
   await assert.rejects(() => a, /refused A/);
   assert.equal(await b, true);
   assert.deepEqual(gate.committedMark(TEST_REPO, HEAD), mark(RANK_FAILURE, 'lint', 'test'));
-  // C: the same result again, which must now be a duplicate.
   let cDelivered = false;
   assert.equal(
     await emit(gate, HEAD, mark(RANK_FAILURE, 'lint', 'test'), async () => {
@@ -871,10 +786,6 @@ test('supersession is decided inside the queue, against the mark committed by th
   });
   let secondDelivered = false;
 
-  // The first emission will commit [lint, test]; the second, queued behind it
-  // with only [lint], must read the *committed* mark when its turn comes and
-  // find itself covered — not the empty record it would have seen at queue
-  // time.
   const first = emit(gate, HEAD, mark(RANK_FAILURE, 'lint', 'test'), async () => {
     await firstHeld;
   });
@@ -888,14 +799,8 @@ test('supersession is decided inside the queue, against the mark committed by th
   assert.equal(secondDelivered, false);
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// resolveCheckEvents: enrichment is also the readiness gate
-// ─────────────────────────────────────────────────────────────────────────────
-
 test('resolveCheckEvents holds back a head whose other suite is still running', async () => {
   const api = new FakeGitHubApi();
-  // Runs exist on the sha but nothing has settled: reporting now would spend
-  // the sha's one emission on a partial job list.
   api.seedCheckRuns(TEST_REPO, {
     sha: HEAD,
     conclusion: null,
@@ -941,9 +846,8 @@ test('resolveCheckEvents forwards the event unchanged when the lookup throws', a
 });
 
 test('resolveCheckEvents keeps the payload conclusion when the API knows no runs', async () => {
-  // The fake answers `{ total: 0 }` for an unseeded sha, the way a 200 with an
-  // empty list does; the payload is then all there is to go on, and holding
-  // the event back would mean never reporting it.
+  // GitHub answers a sha with no check runs with an empty list, as the fake
+  // does for an unseeded sha.
   const [event] = await resolveCheckEvents(normalizeWebhook(load('check_suite.completed.json')), new FakeGitHubApi());
   assert.equal(event.checks?.conclusion, 'failure');
   assert.deepEqual(event.checks?.failed, []);
@@ -959,12 +863,9 @@ test('checksPollKey and the polled event id carry the conclusion, the job count 
   assert.match(checksPollKey(one), new RegExp(`^checks:${HEAD}:failure:1:[0-9a-f]{12}$`));
   const two = { ...one, failed: [...one.failed, { name: 'test', url: 'u' }] };
   assert.match(checksPollKey(two), new RegExp(`^checks:${HEAD}:failure:2:[0-9a-f]{12}$`));
-  // Same count, different job (review round 4): a different key.
   const other = { ...one, failed: [{ name: 'test', url: 'u' }] };
   assert.notEqual(checksPollKey(other), checksPollKey(one));
-  // The fingerprint is order-independent and ignores urls.
   const reordered = { ...two, failed: [{ name: 'test', url: 'x' }, { name: 'lint', url: 'y' }] };
   assert.equal(checksPollKey(reordered), checksPollKey(two));
-  // The event id is the key, so the durable dedup ring and the event agree.
   assert.equal(normalizePolledChecks(TEST_REPO, PULL_58, two, 'u', RECEIVED_AT).id, `poll:${checksPollKey(two)}`);
 });

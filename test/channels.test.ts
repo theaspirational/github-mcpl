@@ -1,19 +1,3 @@
-/**
- * Channels (TASK-SRHKG.1.5): registration, the label bound, incoming shape and
- * thread-id rules, publish routing, refusals, typing.
- *
- * Both seams the package declares are exercised for real:
- *
- *   - the host, over a `McplConnection` pair, so every descriptor and every
- *     incoming message is actually serialized to JSON-RPC and parsed back on
- *     the host side before it is asserted on (the same fake-host wiring
- *     test/harness.ts uses, kept here because the .1 skeleton's server does
- *     not route channel methods yet — .9 does that, and `harness()` then
- *     drives this module through the server);
- *   - GitHub, through the harness's {@link FakeGitHubApi}: no network, and the
- *     call log is what publish routing is asserted against.
- */
-
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
 import { test } from 'node:test';
@@ -32,27 +16,13 @@ import { McplRpcError } from '../src/errors.js';
 import { LIMITS, channelId, type EventMetadata, type NormalizedEvent, type ThreadRef } from '../src/types.js';
 import { FakeGitHubApi, TEST_BOT, TEST_REPO, until } from './harness.js';
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Fake host
-// ─────────────────────────────────────────────────────────────────────────────
-
 interface FakeHost {
-  /** What ChannelRegistry sends through. */
   conn: HostConnection;
-  /** Every request the registry sent, in order, as the host parsed it. */
   saw: JsonRpcRequest[];
   sent(m: string): JsonRpcRequest[];
-  /** Channel ids the host answers `accepted: false` for. */
   refuse: Set<string>;
-  /** Methods the host answers with a JSON-RPC error instead of a result. */
   errorOn: Set<string>;
-  /** What the host answers to `channels/incoming`. */
   acceptIncoming: boolean;
-  /**
-   * Stop answering: every request the host receives from now on is parked.
-   * The returned function sends every parked answer, in arrival order — the
-   * host that takes its time, so a test can decide what races what.
-   */
   hold(): () => void;
   close(): void;
 }
@@ -63,7 +33,6 @@ function fakeHost(): FakeHost {
   const serverConn = McplConnection.fromStreams(toServer, toHost);
   const hostConn = McplConnection.fromStreams(toHost, toServer);
 
-  /** Parked answers while the host is holding; see FakeHost.hold. */
   let parked: (() => void)[] | null = null;
 
   const state: FakeHost = {
@@ -123,20 +92,14 @@ function fakeHost(): FakeHost {
   return state;
 }
 
-/** A logger that says nothing: these tests assert on traffic, not on stderr. */
 const quiet = { debug() {}, info() {}, warn() {}, error() {} };
 
 function registry(host: FakeHost): ChannelRegistry {
   return new ChannelRegistry({ host: host.conn, logger: quiet });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// mcpl-core shape validation (acceptance 1)
-// ─────────────────────────────────────────────────────────────────────────────
-
 const DIRECTIONS = ['outbound', 'inbound', 'bidirectional'];
 
-/** Every required member of mcpl-core's ChannelDescriptor, as the host got it. */
 function assertValidDescriptor(value: unknown): ChannelDescriptor {
   assert.equal(typeof value, 'object');
   const d = value as Record<string, unknown>;
@@ -154,7 +117,6 @@ function assertValidDescriptor(value: unknown): ChannelDescriptor {
   return d as unknown as ChannelDescriptor;
 }
 
-/** Every required member of mcpl-core's IncomingChannelMessage. */
 function assertValidIncoming(value: unknown): IncomingChannelMessage {
   assert.equal(typeof value, 'object');
   const m = value as Record<string, unknown>;
@@ -182,10 +144,6 @@ function assertValidIncoming(value: unknown): IncomingChannelMessage {
   }
   return m as unknown as IncomingChannelMessage;
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Fixtures
-// ─────────────────────────────────────────────────────────────────────────────
 
 const ISSUE: ThreadRef = { repo: TEST_REPO, number: 7, kind: 'issue' };
 const PULL: ThreadRef = { repo: TEST_REPO, number: 12, kind: 'pull' };
@@ -224,10 +182,6 @@ function event(partial: Partial<NormalizedEvent> = {}): NormalizedEvent {
 }
 
 const TEXT: ContentBlock[] = [{ type: 'text', text: 'rendered body' }];
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Registration
-// ─────────────────────────────────────────────────────────────────────────────
 
 test('registration is lazy: nothing is announced until a thread is touched', async () => {
   const host = fakeHost();
@@ -286,9 +240,6 @@ test("a registration still in flight does not swallow the next touch's title and
   const reg = registry(host);
   const id = channelId(ISSUE);
 
-  // A tool touches the thread before anything knows its title, and the host
-  // takes its time answering; the event behind it closes the issue and names
-  // it. Both fields belong to the host, and neither may be lost to the race.
   const release = host.hold();
   const first = reg.ensureChannel(ISSUE);
   await until(() => host.sent(method.CHANNELS_REGISTER).length === 1, 'the registration to reach the host');
@@ -382,10 +333,6 @@ test('the label title is bounded to 80 chars, notice included', async () => {
   host.close();
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// channels/changed
-// ─────────────────────────────────────────────────────────────────────────────
-
 test('a title change sends channels/changed with the new label', async () => {
   const host = fakeHost();
   const reg = registry(host);
@@ -441,7 +388,6 @@ test('a channels/changed the host refuses leaves the acknowledged descriptor in 
     'the registry reports what the host acknowledged, not what it was told',
   );
 
-  // A later touch with no title of its own still owes the host the update.
   host.refuse.clear();
   await reg.ensureChannel(ISSUE);
   const changed = host.sent(method.CHANNELS_CHANGED);
@@ -452,7 +398,6 @@ test('a channels/changed the host refuses leaves the acknowledged descriptor in 
   );
   assert.equal(reg.get(id)?.label, 'anima-research/rayforce#7: Second title');
 
-  // Acknowledged now: a further touch owes nothing.
   await reg.ensureChannel(ISSUE);
   assert.equal(host.sent(method.CHANNELS_CHANGED).length, 2);
   host.close();
@@ -465,7 +410,6 @@ test('a channels/changed that errors in transport stays retryable', async () => 
   await reg.ensureChannel(ISSUE, 'First title');
 
   host.errorOn.add(method.CHANNELS_CHANGED);
-  // A host error on a label update is logged, not thrown: the channel works.
   await reg.ensureChannel(ISSUE, 'Second title');
   assert.equal(host.sent(method.CHANNELS_CHANGED).length, 1);
   assert.equal(reg.get(id)?.label, 'anima-research/rayforce#7: First title', 'the cache did not advance');
@@ -490,10 +434,6 @@ test('an event that moves neither title nor state sends no channels/changed', as
   assert.equal(host.sent(method.CHANNELS_CHANGED).length, 0);
   host.close();
 });
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Incoming
-// ─────────────────────────────────────────────────────────────────────────────
 
 test('incoming carries the contract shape: sender, timestamp, tags, metadata', async () => {
   const host = fakeHost();
@@ -566,10 +506,6 @@ test('a host that refuses the message reports it undelivered', async () => {
   host.close();
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// threadId rules
-// ─────────────────────────────────────────────────────────────────────────────
-
 test('threadId rules: top-level comments carry none, review comments rt:, review summaries review:', () => {
   assert.equal(threadIdForEvent(event({ kind: 'comment.created' })), undefined);
   assert.equal(threadIdForEvent(event({ kind: 'issue.opened' })), undefined);
@@ -632,10 +568,6 @@ test('a top-level comment sends no threadId member at all', async () => {
   assert.ok(!('threadId' in params.messages[0]), 'absent, not null and not empty');
   host.close();
 });
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Publish routing
-// ─────────────────────────────────────────────────────────────────────────────
 
 async function publishFixture(): Promise<{ host: FakeHost; reg: ChannelRegistry; api: FakeGitHubApi }> {
   const host = fakeHost();
@@ -746,10 +678,6 @@ test('publish joins the text blocks and skips an empty turn without an error', a
   host.close();
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Refusals
-// ─────────────────────────────────────────────────────────────────────────────
-
 async function refusal(fn: () => Promise<unknown>): Promise<McplRpcError> {
   try {
     await fn();
@@ -849,10 +777,6 @@ test('a review-thread reply on an issue channel is refused with -32602', async (
   assert.deepEqual(api.callLog(), [], 'review comments live on pull requests only');
   host.close();
 });
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Typing
-// ─────────────────────────────────────────────────────────────────────────────
 
 test('typing is a no-op that answers success', async () => {
   const host = fakeHost();

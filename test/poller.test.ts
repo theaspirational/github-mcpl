@@ -4,19 +4,6 @@ import { join } from 'node:path';
 import { GithubState } from '../src/state.js';
 import { summarizeChecks } from '../src/github-adapter.js';
 import { checksCases, checkRuns } from './checks-cases.js';
-/**
- * Polling ingress (TASK-SRHKG.1.3, contract amendment 1).
- *
- * The two acceptance properties are asserted directly:
- *
- *   - the interval floor, including what an `X-Poll-Interval` may and may not
- *     do to it (`observePollInterval`);
- *   - "marks read only after delivery" — the amendment's equivalent of a
- *     notification mark-read is the dedup gate and the cursor, so a key is
- *     written only once the listener took its event, and a failed delivery is
- *     re-attempted on the next pass instead of being consumed.
- */
-
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import {
@@ -40,16 +27,10 @@ import { FakeGitHubApi, TEST_BOT, TEST_REPO } from './harness.js';
 
 const OTHER_REPO = { owner: 'other-org', name: 'other-repo' };
 
-/**
- * `IngressState` over a Map, with `StateStore`'s own gate semantics:
- * `seenPollKey` records on a miss, `snapshot()` only reads.
- */
 class MemoryIngressState implements IngressState {
   private cursor: string | null = null;
   private readonly keys: string[] = [];
-  /** Amendment 2a: the last polled head of each pull request, by channel id. */
   readonly heads = new Map<string, string>();
-  /** Every `setLastPollAt`, in order — the cursor's whole history. */
   readonly cursorWrites: string[] = [];
 
   constructor(cursor: string | null = null) {
@@ -110,7 +91,6 @@ interface Rig {
   state: MemoryIngressState;
   poller: Poller;
   events: NormalizedEvent[];
-  /** Every sha `getCheckRuns` was asked about, in order, across all passes. */
   checkCalls: string[];
 }
 
@@ -126,10 +106,6 @@ interface RigOptions {
   checkGate?: CheckGate;
   onEvent?: (event: NormalizedEvent) => void;
   repos?: readonly { owner: string; name: string }[];
-  /**
-   * Stand in for `getCheckRuns`. `call` is the 1-based number of the lookup
-   * for this rig, so a test can script "throw once, then answer".
-   */
   getCheckRuns?: (repo: RepoRef, sha: string, call: number) => Promise<ChecksSummary>;
 }
 
@@ -139,8 +115,6 @@ function rig(opts: RigOptions = {}): Rig {
   const events: NormalizedEvent[] = [];
   const now = new Date(opts.now ?? '2026-10-14T00:00:00.000Z');
   const checkCalls: string[] = [];
-  // Delegate to the fake (so its own call log keeps working) but record the
-  // shas here too, because the backlog's drain order is the thing under test.
   const pollerApi: PollerApi = {
     listIssuesSince: (repo, since) => api.listIssuesSince(repo, since),
     listIssueCommentsSince: (repo, since) => api.listIssueCommentsSince(repo, since),
@@ -177,7 +151,6 @@ async function onePass(r: Rig) {
   return result;
 }
 
-/** A completed summary for `sha`, failing on one job. */
 function failedSummary(sha: string): ChecksSummary {
   return {
     sha,
@@ -187,13 +160,7 @@ function failedSummary(sha: string): ChecksSummary {
   };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// The interval floor and X-Poll-Interval
-// ─────────────────────────────────────────────────────────────────────────────
-
 test('the effective interval never drops below the 60 s floor', () => {
-  // readConfig already refuses a sub-floor GITHUB_POLL_INTERVAL_MS; the poller
-  // does not rely on that and floors it again.
   assert.equal(rig({ intervalMs: 1 }).poller.effectiveIntervalMs, MIN_POLL_INTERVAL_MS);
   assert.equal(rig({ intervalMs: MIN_POLL_INTERVAL_MS }).poller.effectiveIntervalMs, MIN_POLL_INTERVAL_MS);
   assert.equal(rig({ intervalMs: 300_000 }).poller.effectiveIntervalMs, 300_000);
@@ -203,13 +170,10 @@ test('the effective interval never drops below the 60 s floor', () => {
 test('X-Poll-Interval raises the interval and can never lower it', () => {
   const { poller } = rig({ intervalMs: 300_000 });
 
-  // Below the configured interval: honoured (recorded) but not obeyed downward.
   assert.equal(poller.observePollInterval('60'), 300_000);
   assert.equal(poller.observePollInterval('120'), 300_000);
-  // Above it: obeyed.
   assert.equal(poller.observePollInterval('900'), 900_000);
   assert.equal(poller.effectiveIntervalMs, 900_000);
-  // And a later smaller value drops back only to the configured floor.
   assert.equal(poller.observePollInterval('65'), 300_000);
 });
 
@@ -236,10 +200,6 @@ test('GITHUB_POLL_INTERVAL_MS = 0 is polling off and start() does nothing', asyn
   assert.deepEqual(r.api.callLog(), []);
   assert.equal(rig({ intervalMs: MIN_POLL_INTERVAL_MS }).poller.enabled, true);
 });
-
-// ─────────────────────────────────────────────────────────────────────────────
-// The cursor
-// ─────────────────────────────────────────────────────────────────────────────
 
 test('a pass queries every allow-listed repo since the cursor and advances it', async () => {
   const r = rig({ cursor: '2026-10-13T00:00:00.000Z', now: '2026-10-14T00:00:00.000Z' });
@@ -286,17 +246,11 @@ test('only the allow-listed repositories are ever asked', async () => {
   for (const call of api.calls) assert.deepEqual(call.args[0], TEST_REPO);
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Rows → events
-// ─────────────────────────────────────────────────────────────────────────────
-
-// ── Amendment 2a through the real poller ──
-
 test('a freshly opened issue arrives as issue.opened, an older one as issue.edited (amendment 2a)', async () => {
   const api = new FakeGitHubApi();
-  // Created after the cursor: this pass is the first that could have seen it.
   api.seedIssue({ number: 41, createdAt: '2026-10-13T10:00:00.000Z', updatedAt: '2026-10-13T10:00:00.000Z' });
-  // Created before it, touched since: an edit, and a poll cannot say of what.
+  // Created before the cursor and updated since: GitHub's list gives
+  // updated_at, not what changed.
   api.seedIssue({ number: 42, createdAt: '2026-10-01T00:00:00.000Z', updatedAt: '2026-10-13T11:00:00.000Z' });
 
   const r = rig({ api, cursor: '2026-10-13T09:00:00.000Z' });
@@ -305,7 +259,6 @@ test('a freshly opened issue arrives as issue.opened, an older one as issue.edit
     result.delivered.map((e) => `${e.thread?.number}:${e.kind}`),
     ['41:issue.opened', '42:issue.edited'],
   );
-  // The tag the recipes key on follows the kind.
   assert.equal(result.delivered[0].kind, 'issue.opened');
 });
 
@@ -314,7 +267,6 @@ test('an open pull request whose head did not move is dropped on the next pass (
   const pull = api.seedPullRequest({ number: 58, createdAt: '2026-10-01T00:00:00.000Z', updatedAt: '2026-10-13T12:00:00.000Z' });
 
   const r = rig({ api, cursor: '2026-10-13T09:00:00.000Z' });
-  // Pass one: never seen before, so its head counts as moved — one sighting.
   const first = await r.poller.pollOnce();
   assert.deepEqual(
     first.delivered.map((e) => e.kind),
@@ -322,9 +274,7 @@ test('an open pull request whose head did not move is dropped on the next pass (
   );
   assert.equal(r.state.heads.get('github:anima-research/rayforce#58'), pull.head.sha);
 
-  // Pass two: a comment bumps the pull request's row without moving its head.
-  // The comment is the event; re-announcing the pull request beside it is the
-  // duplicate amendment 2a removes.
+  // A comment bumps the pull request's updated_at without moving its head.
   api.seedComment({ repo: TEST_REPO, number: 58, kind: 'pull' }, { id: 7002, updatedAt: '2026-10-14T01:00:00.000Z' });
   pull.updatedAt = '2026-10-14T01:00:00.000Z';
   const second = await r.poller.pollOnce();
@@ -333,7 +283,6 @@ test('an open pull request whose head did not move is dropped on the next pass (
     ['comment.created'],
   );
 
-  // Pass three: new commits. The head moved, so the row is a synchronize again.
   pull.head = { ...pull.head, sha: 'f'.repeat(40) };
   pull.updatedAt = '2026-10-14T02:00:00.000Z';
   const third = await r.poller.pollOnce();
@@ -364,7 +313,6 @@ test('a refused pull.synchronize is retried on the next pass and delivered once 
     updatedAt: '2026-10-13T12:00:00.000Z',
   });
 
-  // Pass one: never seen, so the head counts as moved — and the host refuses.
   let refuse = true;
   const attempts: string[] = [];
   const r = rig({
@@ -379,15 +327,9 @@ test('a refused pull.synchronize is retried on the next pass and delivered once 
   const first = await r.poller.pollOnce();
   assert.equal(first.failed, 1);
   assert.deepEqual(first.delivered, []);
-  // The cursor is held back, as it always was…
   assert.equal(first.cursorAdvanced, false);
-  // …and the head must be held back with it. Committing it here is what lost
-  // the event for good: the next pass would compare the row against this very
-  // sha, find no change, drop it, and let the cursor move past it.
   assert.equal(r.state.heads.get('github:anima-research/rayforce#58'), undefined);
 
-  // Pass two: the same row is queried again (the cursor never moved) and the
-  // host takes it this time.
   refuse = false;
   const second = await r.poller.pollOnce();
   assert.deepEqual(
@@ -399,10 +341,8 @@ test('a refused pull.synchronize is retried on the next pass and delivered once 
   assert.equal(second.cursorAdvanced, true);
   assert.equal(second.failed, 0);
   assert.deepEqual(attempts, ['pull.synchronize', 'pull.synchronize'], 'attempted twice, delivered once');
-  // Accepted, so now it is committed.
   assert.equal(r.state.heads.get('github:anima-research/rayforce#58'), pull.head.sha);
 
-  // Pass three: nothing moved since, so the row is dropped as usual.
   pull.updatedAt = '2026-10-14T01:00:00.000Z';
   const third = await r.poller.pollOnce();
   assert.deepEqual(third.delivered, [], 'and the retry did not leave it announcing forever');
@@ -415,8 +355,6 @@ test('a collection failure after a changed head does not advance the head (findi
     createdAt: '2026-10-01T00:00:00.000Z',
     updatedAt: '2026-10-13T12:00:00.000Z',
   });
-  // The issue rows are read first and this one is read after them, so it
-  // throws with the changed head already in hand but nothing delivered.
   api.listIssueCommentsSince = async () => {
     throw new Error('GitHub 502 on the comment page');
   };
@@ -429,7 +367,6 @@ test('a collection failure after a changed head does not advance the head (findi
     'a pass that delivered nothing advanced nothing',
   );
 
-  // So the recovered pass still announces the commits.
   delete (api as { listIssueCommentsSince?: unknown }).listIssueCommentsSince;
   const recovered = await r.poller.pollOnce();
   assert.deepEqual(
@@ -445,11 +382,7 @@ test('a dropped pull-request row still records its head, so the next pass agrees
   const r = rig({ api, cursor: '2026-10-13T09:00:00.000Z' });
   await r.poller.pollOnce();
 
-  // Two further passes, each with a comment that bumps the pull request's row.
-  // The comment is delivered every time — which is what proves the pass really
-  // collected these rows — while the pull-request row beside it is dropped
-  // every time: the head is recorded on a drop as well as on a delivery, so no
-  // pass ever mistakes the unchanged head for a change.
+  // Each comment bumps the pull request's updated_at without moving its head.
   let id = 7100;
   for (const at of ['2026-10-14T01:00:00.000Z', '2026-10-14T02:00:00.000Z']) {
     api.seedComment({ repo: TEST_REPO, number: 58, kind: 'pull' }, { id: id++, updatedAt: at });
@@ -467,7 +400,7 @@ test('issues, comments and review comments updated since the cursor are delivere
   const api = new FakeGitHubApi();
   const issue = api.seedIssue({ number: 41, updatedAt: '2026-10-13T10:00:00.000Z' });
   api.seedComment({ repo: TEST_REPO, number: 41, kind: 'issue' }, { id: 7001, updatedAt: '2026-10-13T11:00:00.000Z' });
-  const pull = api.seedPullRequest({ number: 58, updatedAt: '2026-10-13T12:00:00.000Z' });
+  const pull = api.seedPullRequest({ number: 58, createdAt: '2026-10-01T00:00:00.000Z', updatedAt: '2026-10-13T12:00:00.000Z' });
   api.seedReviewThread(
     { repo: TEST_REPO, number: 58, kind: 'pull' },
     {
@@ -491,8 +424,6 @@ test('issues, comments and review comments updated since the cursor are delivere
   const result = await r.poller.pollOnce();
   assert.deepEqual(
     result.delivered.map((e) => e.kind),
-    // `pull.synchronize`, not `pull.opened`: amendment 2a reserves `opened`
-    // for a row created at or after the cursor, and this one predates it.
     ['issue.edited', 'comment.created', 'pull.synchronize', 'review_comment.created'],
   );
   assert.deepEqual(
@@ -504,12 +435,10 @@ test('issues, comments and review comments updated since the cursor are delivere
       'poll:review_comment:9001:2026-10-13T13:00:00.000Z',
     ],
   );
-  // The acceptance fields: thread, actor, sha, review-comment detail.
   assert.deepEqual(result.delivered[3].thread, { repo: TEST_REPO, number: 58, kind: 'pull' });
   assert.equal(result.delivered[3].reviewComment?.path, 'src/scheduler/tick.rs');
   assert.equal(result.delivered[2].sha, pull.head.sha);
   assert.deepEqual(result.delivered[0].actor, { login: 'human-one', isBot: false });
-  // `receivedAt` is the start of the pass, not the row's timestamp.
   for (const e of result.delivered) assert.equal(e.receivedAt, '2026-10-14T00:00:00.000Z');
 });
 
@@ -535,7 +464,6 @@ test('an open pull-request head gets one checks event per conclusion, and none w
   assert.deepEqual(checks[0].thread, { repo: TEST_REPO, number: 58, kind: 'pull' });
   assert.deepEqual(api.callsTo('getCheckRuns')[0].args, [TEST_REPO, pull.head.sha]);
 
-  // A head with no runs at all produces nothing.
   const bare = new FakeGitHubApi();
   bare.seedPullRequest({ number: 59, updatedAt: '2026-10-13T12:00:00.000Z' });
   const r2 = rig({ api: bare });
@@ -547,7 +475,6 @@ test('an open pull-request head gets one checks event per conclusion, and none w
 });
 
 test('a settled head whose failed jobs change with the same count is news, not a duplicate', async () => {
-  // Review round 4: the poll key must distinguish failure *sets*, not counts.
   const api = new FakeGitHubApi();
   const pull = api.seedPullRequest({ number: 58, updatedAt: '2026-10-13T12:00:00.000Z' });
   const sets = [
@@ -562,7 +489,6 @@ test('a settled head whose failed jobs change with the same count is news, not a
   const first = await r.poller.pollOnce();
   assert.deepEqual(first.delivered.filter((e) => e.kind === 'checks.completed').map((e) => e.checks?.failed.map((f) => f.name)), [['lint']]);
 
-  // The same open head is updated again; its runs now fail on a different job.
   api.seedPullRequest({ number: 58, head: pull.head, updatedAt: '2026-10-14T01:00:00.000Z' });
   const second = await r.poller.pollOnce();
   assert.equal(second.duplicates, 0, 'a different failed set is not a duplicate');
@@ -596,7 +522,7 @@ test('at most 20 pull-request heads are checked in one pass', async () => {
 
 test('a check-runs lookup that throws does not lose the rest of the pass, and the head is kept', async () => {
   const api = new FakeGitHubApi();
-  api.seedPullRequest({ number: 58, updatedAt: '2026-10-13T12:00:00.000Z' });
+  api.seedPullRequest({ number: 58, createdAt: '2026-10-01T00:00:00.000Z', updatedAt: '2026-10-13T12:00:00.000Z' });
   const r = rig({
     api,
     getCheckRuns: async () => {
@@ -606,22 +532,14 @@ test('a check-runs lookup that throws does not lose the rest of the pass, and th
   const result = await r.poller.pollOnce();
   assert.deepEqual(
     result.delivered.map((e) => e.kind),
-    // Amendment 2a: this pull request was created before the cursor and the
-    // poll state has no head for it yet, so its first sighting is a synchronize.
     ['pull.synchronize'],
   );
-  // A lookup failure is not a delivery failure, so the cursor still moves —
-  // which is only safe because the head itself is retained for another pass.
   assert.equal(result.failed, 0);
   assert.equal(result.cursorAdvanced, true);
   assert.equal(result.checkLookups, 1);
   assert.equal(result.checksBacklog, 1, 'the unfinished head must be kept');
   assert.equal(r.poller.checkBacklogSize, 1);
 });
-
-// ─────────────────────────────────────────────────────────────────────────────
-// "Marked only after delivery": the gate and the cursor
-// ─────────────────────────────────────────────────────────────────────────────
 
 test('a row already in the gate is not delivered twice', async () => {
   const api = new FakeGitHubApi();
@@ -632,9 +550,6 @@ test('a row already in the gate is not delivered twice', async () => {
   assert.equal(first.delivered.length, 1);
   assert.deepEqual(r.state.snapshot().pollKeys, ['issue:41:2026-10-13T10:00:00.000Z']);
 
-  // Rewind the cursor so the very same row is queried again, and forget its
-  // marker as an eviction would: now the gate, and not the cursor or the
-  // marker, is the only thing that can stop the duplicate.
   r.state.setLastPollAt('2026-10-13T00:00:00.000Z');
   r.state.setPollCursors({});
   r.state.heads.clear();
@@ -649,7 +564,6 @@ test('an edit of the same row is a fresh event: the key carries updated_at', asy
   const r = rig({ api });
   assert.equal((await r.poller.pollOnce()).delivered.length, 1);
 
-  // Edited after the pass that first delivered it, so the next pass sees it.
   issue.body = 'edited body';
   issue.updatedAt = '2026-10-14T01:00:00.000Z';
   const second = await r.poller.pollOnce();
@@ -668,7 +582,6 @@ test('a key is recorded only after its event was delivered', async () => {
   const r = rig({
     api,
     onEvent: (event) => {
-      // Inside the listener the key is not in the gate yet.
       ringDuringDelivery.push(r.state.snapshot().pollKeys);
       assert.equal(event.kind, 'issue.edited');
     },
@@ -697,7 +610,6 @@ test('a failed delivery leaves its key unrecorded, holds the cursor, and is retr
   assert.equal(first.cursorAdvanced, false);
   assert.equal(r.state.lastPollAt(), '2026-10-13T00:00:00.000Z', 'the cursor must not move');
 
-  // The next pass therefore sees the row again and delivers it.
   const second = await r.poller.pollOnce();
   assert.equal(attempts, 2);
   assert.equal(second.delivered.length, 1);
@@ -732,15 +644,9 @@ test('one failure does not block the rows around it, and only it is retried', as
     second.delivered.map((e) => e.thread?.number),
     [42],
   );
-  // The two that already landed recorded their markers, so their unchanged
-  // rows drop before the gate; the refused one never recorded its marker.
   assert.equal(second.duplicates, 0);
   assert.equal(second.cursorAdvanced, true);
 });
-
-// ─────────────────────────────────────────────────────────────────────────────
-// A comment's bump is not an issue change (the 2026-10-15 rehearsal)
-// ─────────────────────────────────────────────────────────────────────────────
 
 test('the bot\'s comment and close on an issue that mentions it do not come back as a human mention', async () => {
   const api = new FakeGitHubApi();
@@ -754,7 +660,7 @@ test('the bot\'s comment and close on an issue that mentions it do not come back
   const first = await r.poller.pollOnce();
   assert.deepEqual(first.delivered.map((e) => e.kind), ['issue.opened']);
 
-  // The bot comments: the comment bumps the issue's updated_at, nothing else.
+  // A comment bumps the issue's updated_at and comments count, nothing else.
   const bot = { login: TEST_BOT.login, isBot: true };
   api.seedComment({ repo: TEST_REPO, number: 10, kind: 'issue' }, { author: bot, body: 'Seen.', updatedAt: '2026-10-14T01:00:00.000Z' });
   issue.updatedAt = '2026-10-14T01:00:00.000Z';
@@ -762,7 +668,6 @@ test('the bot\'s comment and close on an issue that mentions it do not come back
   assert.deepEqual(second.delivered.map((e) => e.kind), ['comment.created'], 'no issue row beside the comment');
   assert.equal(second.delivered[0].actor.login, TEST_BOT.login);
 
-  // The bot closes it: delivered once, as the bot's own act.
   issue.state = 'closed';
   issue.updatedAt = '2026-10-14T02:00:00.000Z';
   api.closedBy.set(10, bot);
@@ -770,7 +675,6 @@ test('the bot\'s comment and close on an issue that mentions it do not come back
   assert.deepEqual(third.delivered.map((e) => e.kind), ['issue.closed']);
   assert.equal(third.delivered[0].actor.login, TEST_BOT.login, 'closed_by, not the author');
 
-  // A human comments on the closed issue: the comment, and no second close.
   api.seedComment({ repo: TEST_REPO, number: 10, kind: 'issue' }, { body: 'thanks', updatedAt: '2026-10-14T03:00:00.000Z' });
   issue.updatedAt = '2026-10-14T03:00:00.000Z';
   const fourth = await r.poller.pollOnce();
@@ -797,13 +701,7 @@ test('a title or body edit, and a reopen, still arrive under polling', async () 
     'a reopen changes the state half of the marker');
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// The state seam
-// ─────────────────────────────────────────────────────────────────────────────
-
 test('each list starts from lastPollAt until it has a cursor of its own, then keeps it', async () => {
-  // A state file from before per-list cursors carries `lastPollAt` alone, and
-  // one cursor for a repository no longer polled.
   const r = rig({ cursor: '2026-10-13T00:00:00.000Z', repos: [TEST_REPO, OTHER_REPO] });
   r.state.setPollCursors({ 'gone/repo:issues': { since: '2026-10-01T00:00:00.000Z' } });
 
@@ -820,7 +718,6 @@ test('each list starts from lastPollAt until it has a cursor of its own, then ke
     'other-org/other-repo:review_comments': { since: start },
   });
 
-  // A list catching up reads from where it stopped; the others from their own.
   r.state.setPollCursors({
     ...r.state.pollCursors(),
     'anima-research/rayforce:issues': { since: '2026-10-13T00:00:00.000Z', resumeAt: '2026-10-13T06:00:00Z' },
@@ -867,14 +764,12 @@ test('a refused pass keeps the rows it announced as new, so a retry does not ope
     'anima-research/rayforce:issues': { '41': '2026-10-13T12:00:00.000Z', '58': '2026-10-13T12:00:00.000Z' },
   });
 
-  // Both change before the retry: the issue is edited, the pull request pushed.
   issue.body = 'edited';
   issue.updatedAt = '2026-10-13T13:00:00.000Z';
   pull.head = { ...pull.head, sha: 'f'.repeat(40) };
   pull.updatedAt = '2026-10-13T13:00:00.000Z';
   const second = await r.poller.pollOnce();
   assert.deepEqual(second.delivered.map((e) => e.kind).sort(), ['comment.created', 'issue.edited', 'pull.synchronize']);
-  // The pass delivered, and its window starts after both were created.
   assert.deepEqual(r.state.fresh, {});
 });
 
@@ -903,7 +798,6 @@ test('lastPollAt is the earliest place a list stopped, and never past the pass s
   await r.poller.pollOnce();
   assert.equal(r.state.lastPollAt(), '2026-10-13T07:00:00Z');
 
-  // A stop stamped after the pass started, as a row changed during it can be.
   api.listIssuesSince = async () => ({ rows: [] });
   api.listIssueCommentsSince = async () => ({ rows: [], resumeAt: '2026-10-14T00:00:05Z' });
   await r.poller.pollOnce();
@@ -912,7 +806,6 @@ test('lastPollAt is the earliest place a list stopped, and never past the pass s
 
 test('a first pass whose read throws keeps the window it read', async () => {
   const api = new FakeGitHubApi();
-  // The very first read throws, so the window must be kept before any read.
   api.listIssuesSince = async () => {
     throw new Error('GitHub 502 on the issues page');
   };
@@ -952,13 +845,9 @@ test('a refused first pass keeps the window it read', async () => {
   assert.equal(r.state.lastPollAt(), first.since, 'the retry asks from the same start, not one moved on by the clock');
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// The check backlog: unfinished check work survives the cursor
-// ─────────────────────────────────────────────────────────────────────────────
-
 test('a transient lookup failure is retried on the next pass, after the cursor moved on', async () => {
   const api = new FakeGitHubApi();
-  const pull = api.seedPullRequest({ number: 58, updatedAt: '2026-10-13T12:00:00.000Z' });
+  const pull = api.seedPullRequest({ number: 58, createdAt: '2026-10-01T00:00:00.000Z', updatedAt: '2026-10-13T12:00:00.000Z' });
   api.seedCheckRuns(TEST_REPO, failedSummary(pull.head.sha));
   const r = rig({
     api,
@@ -968,19 +857,14 @@ test('a transient lookup failure is retried on the next pass, after the cursor m
     },
   });
 
-  // Pass one: the row lands, the lookup fails, the head is kept.
   const first = await onePass(r);
   assert.deepEqual(
     first.delivered.map((e) => e.kind),
-    // Amendment 2a: this pull request was created before the cursor and the
-    // poll state has no head for it yet, so its first sighting is a synchronize.
     ['pull.synchronize'],
   );
   assert.equal(first.checksBacklog, 1);
   assert.equal(first.cursorAdvanced, true);
 
-  // Pass two: the cursor has moved past the row, so `listIssuesSince` returns
-  // nothing — the backlog is the only reason the checks are asked about again.
   const second = await onePass(r);
   assert.deepEqual((await api.listIssuesSince(TEST_REPO, r.state.lastPollAt() as string)).rows, []);
   assert.deepEqual(
@@ -998,15 +882,11 @@ test('a head whose checks are still running waits, then reports when they finish
   let finished = false;
   const r = rig({
     api,
-    // A short attempt budget: a pending head must not spend attempts, or it
-    // would be given up on before CI finishes.
     maxHeadAttempts: 2,
     getCheckRuns: async (_repo, sha) =>
       finished ? failedSummary(sha) : { sha, conclusion: null, total: 3, failed: [] },
   });
 
-  // Three passes with runs still going: no event, and the head is still held
-  // even though that is more passes than maxHeadAttempts.
   for (const pass of [1, 2, 3]) {
     const result = await onePass(r);
     assert.deepEqual(
@@ -1030,8 +910,8 @@ test('a head whose checks are still running waits, then reports when they finish
 test('a head that never gets check runs is given up on after its attempts', async () => {
   const api = new FakeGitHubApi();
   api.seedPullRequest({ number: 58, updatedAt: '2026-10-13T12:00:00.000Z' });
-  // Unseeded sha: the fake answers `{ total: 0 }`, as a head no workflow
-  // matches does.
+  // GitHub answers total_count 0 for a head no workflow matches, as the fake
+  // does for an unseeded sha.
   const r = rig({ api, maxHeadAttempts: 3 });
 
   assert.equal((await onePass(r)).checksBacklog, 1);
@@ -1042,7 +922,6 @@ test('a head that never gets check runs is given up on after its attempts', asyn
     r.events.filter((e) => e.kind === 'checks.completed'),
     [],
   );
-  // And it is not asked about a fourth time.
   assert.equal((await onePass(r)).checkLookups, 0);
   assert.equal(MAX_HEAD_ATTEMPTS, 10);
 });
@@ -1062,14 +941,11 @@ test('heads beyond the per-pass cap are drained by the following passes', async 
   assert.equal(first.delivered.filter((e) => e.kind === 'checks.completed').length, 20);
   assert.equal(first.checksBacklog, 5, 'the five the cap cut off are kept');
 
-  // The cursor has moved past every row, so without the backlog this pass
-  // would do nothing at all — the regression the reviewer reproduced.
   const second = await r.poller.pollOnce();
   assert.equal(second.checkLookups, 5);
   assert.equal(second.delivered.filter((e) => e.kind === 'checks.completed').length, 5);
   assert.equal(second.checksBacklog, 0);
 
-  // Every one of the 25 heads was reported, exactly once.
   const reported = r.events.filter((e) => e.kind === 'checks.completed').map((e) => e.sha);
   assert.equal(reported.length, 25);
   assert.deepEqual([...reported].sort(), [...shas].sort());
@@ -1082,7 +958,6 @@ test('an over-cap backlog drains round-robin instead of starving the tail', asyn
     const pull = api.seedPullRequest({ number: 200 + i, updatedAt: '2026-10-13T12:00:00.000Z' });
     shas.push(pull.head.sha);
   }
-  // Nothing ever settles, so the only question is who gets asked.
   const r = rig({ api, getCheckRuns: async (_repo, sha) => ({ sha, conclusion: null, total: 3, failed: [] }) });
 
   await r.poller.pollOnce();
@@ -1090,8 +965,6 @@ test('an over-cap backlog drains round-robin instead of starving the tail', asyn
 
   r.checkCalls.length = 0;
   await r.poller.pollOnce();
-  // The five that were starved are asked first, because the 20 that were
-  // examined went to the back of the queue.
   assert.deepEqual(r.checkCalls.slice(0, 5), shas.slice(20, 25));
   assert.deepEqual(r.checkCalls.slice(5), shas.slice(0, 15));
   assert.equal(r.poller.checkBacklogSize, 25);
@@ -1134,7 +1007,6 @@ test('the poller reports a head sha once: a second conclusion must be worse', as
 
   assert.equal((await r.poller.pollOnce()).delivered.filter((e) => e.kind === 'checks.completed').length, 1);
 
-  // The same head settles green later (a second workflow): not news.
   conclusion = { sha: pull.head.sha, conclusion: 'success', total: 3, failed: [] };
   api.seedIssue({ number: 41, updatedAt: '2026-10-14T01:00:00.000Z' });
   const pr = api.seedPullRequest({ number: 58, updatedAt: '2026-10-14T01:00:00.000Z' });
@@ -1150,7 +1022,6 @@ test('a poller and a listener sharing a CheckGate report a head sha once', async
   const api = new FakeGitHubApi();
   const pull = api.seedPullRequest({ number: 58, updatedAt: '2026-10-13T12:00:00.000Z' });
   const gate = new CheckGate();
-  // The webhook path got there first and had this exact result accepted.
   const mark: CheckMark = { rank: 7, failed: ['clippy'] };
   assert.equal(await gate.emit(TEST_REPO, pull.head.sha, mark, async () => {}), true);
   const r = rig({ api, checkGate: gate, getCheckRuns: async (_r, sha) => failedSummary(sha) });
@@ -1184,7 +1055,6 @@ test('a refused checks event commits no mark and keeps the backlog slot it needs
   assert.equal(first.cursorAdvanced, false, 'a failed delivery holds the cursor');
   assert.equal(first.checksBacklog, 1, 'and the head stays queued');
 
-  // The retry lands, and only then is the mark committed and the head retired.
   const second = await r.poller.pollOnce();
   assert.equal(attempts, 2);
   const delivered = second.delivered.filter((e) => e.kind === 'checks.completed');
@@ -1193,17 +1063,9 @@ test('a refused checks event commits no mark and keeps the backlog slot it needs
   assert.equal(second.checksBacklog, 0, 'the accepted head left the backlog');
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Review round 2: a head leaves the lifecycle only once its event is accepted
-// ─────────────────────────────────────────────────────────────────────────────
-
 test('a checks event refused long after the cursor moved past its row is still retried', async () => {
-  // The regression the reviewer reproduced. Three passes:
-  //   1. the PR row lands, the checks are still running   → cursor advances
-  //   2. the checks settle, the listener refuses the event
-  //   3. the retry, with the row long gone from the since-query
   const api = new FakeGitHubApi();
-  const pull = api.seedPullRequest({ number: 58, updatedAt: '2026-10-13T12:00:00.000Z' });
+  const pull = api.seedPullRequest({ number: 58, createdAt: '2026-10-01T00:00:00.000Z', updatedAt: '2026-10-13T12:00:00.000Z' });
   const gate = new CheckGate();
   let settled = false;
   let refusals = 0;
@@ -1220,23 +1082,17 @@ test('a checks event refused long after the cursor moved past its row is still r
     },
   });
 
-  // Pass one: the row is delivered, the checks are pending, the cursor moves.
   const first = await onePass(r);
   assert.deepEqual(
     first.delivered.map((e) => e.kind),
-    // Amendment 2a: this pull request was created before the cursor and the
-    // poll state has no head for it yet, so its first sighting is a synchronize.
     ['pull.synchronize'],
   );
   assert.equal(first.cursorAdvanced, true);
   assert.equal(first.checksBacklog, 1);
 
-  // From here on the pull-request row is behind the cursor: the backlog is
-  // the only thing that can produce this checks event.
   const cursor = r.state.lastPollAt() as string;
   assert.deepEqual((await api.listIssuesSince(TEST_REPO, cursor)).rows, []);
 
-  // Pass two: the checks settle and the listener refuses.
   settled = true;
   const second = await onePass(r);
   assert.equal(second.failed, 1);
@@ -1245,7 +1101,6 @@ test('a checks event refused long after the cursor moved past its row is still r
   assert.equal(gate.size, 0, 'and nothing must be committed for it');
   assert.equal(second.cursorAdvanced, false);
 
-  // Pass three: the retry lands, and only now is the head retired.
   const third = await onePass(r);
   assert.deepEqual(
     third.delivered.map((e) => e.kind),
@@ -1263,7 +1118,6 @@ test('a checks event the gate has already spoken for retires its head instead of
   const gate = new CheckGate();
   const r = rig({ api, checkGate: gate, getCheckRuns: async (_repo, sha) => failedSummary(sha) });
 
-  // The webhook path had this exact result accepted first.
   assert.equal(
     await gate.emit(TEST_REPO, pull.head.sha, { rank: 7, failed: ['clippy'] }, async () => {}),
     true,
@@ -1273,7 +1127,6 @@ test('a checks event the gate has already spoken for retires its head instead of
   assert.equal(first.delivered.filter((e) => e.kind === 'checks.completed').length, 0);
   assert.equal(first.duplicates, 1);
   assert.equal(first.checksBacklog, 0, 'dedup confirms delivery, so the head is done');
-  // And it is not looked up again.
   assert.equal((await r.poller.pollOnce()).checkLookups, 0);
 });
 
@@ -1284,12 +1137,10 @@ test('a head whose event was accepted is not re-delivered by the durable gate ei
 
   const first = await r.poller.pollOnce();
   assert.equal(first.delivered.filter((e) => e.kind === 'checks.completed').length, 1);
-  // Both share the row's `updated_at`, so the key breaks the tie.
   const keys = r.state.snapshot().pollKeys;
   assert.equal(keys.length, 2);
   assert.match(keys[0], new RegExp(`^checks:${pull.head.sha}:failure:1:[0-9a-f]{12}$`));
   assert.equal(keys[1], `issue:${pull.number}:2026-10-13T12:00:00.000Z`);
-  // The head is retired, so nothing re-queues it and nothing re-delivers it.
   const second = await r.poller.pollOnce();
   assert.equal(second.checkLookups, 0);
   assert.equal(second.delivered.length, 0);

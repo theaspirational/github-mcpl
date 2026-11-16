@@ -1,11 +1,3 @@
-/**
- * github.issues and github.pr (TASK-SRHKG.1.6).
- *
- * The two refusals the contract turns on are asserted twice over: a base
- * outside GITHUB_PR_BASE_ALLOW on creation and on a retarget, and a repository
- * outside GITHUB_REPOS on every write. Everything runs against FakeGitHubApi.
- */
-
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import { issuesToolModule, prToolModule, requireAllowedBase } from '../src/tools-issues-pr.js';
@@ -24,12 +16,12 @@ import {
 } from '../src/types.js';
 import { FakeGitHubApi, TEST_BOT, TEST_REPO } from './harness.js';
 
+const NO_CHECKPOINT_STORE = undefined as unknown as StateStore;
+
 function ctx(api: FakeGitHubApi, over: Partial<ToolContext> = {}): ToolContext {
   return {
     api,
-    // Neither feature set is rollback-capable, so neither touches the
-    // checkpoint store; an attempt would throw here rather than pass quietly.
-    state: undefined as unknown as StateStore,
+    state: NO_CHECKPOINT_STORE,
     botLogin: TEST_BOT.login,
     repos: [TEST_REPO],
     prBaseAllow: ['dev'],
@@ -73,10 +65,6 @@ test('the two modules declare their feature sets and no merge tool exists', () =
   ]);
   assert.ok(!names.some((n) => /merge|delete_branch/.test(n)));
 });
-
-// ─────────────────────────────────────────────────────────────────────────────
-// github.issues
-// ─────────────────────────────────────────────────────────────────────────────
 
 test('create_issue opens an issue in the default repository', async () => {
   const api = new FakeGitHubApi();
@@ -184,10 +172,6 @@ test('a GitHub error from an issue write carries its status', async () => {
   assert.equal(out, 'reopen_issue failed: GitHub error 403: Issue is locked');
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// github.pr — the base allow-list
-// ─────────────────────────────────────────────────────────────────────────────
-
 test('create_pull_request opens a pull request against an allowed base', async () => {
   const api = new FakeGitHubApi();
   const out = ok(
@@ -238,7 +222,6 @@ test('edit_pull_request refuses a retarget outside GITHUB_PR_BASE_ALLOW', async 
   const out = failure(await prToolModule.call('edit_pull_request', { number: 8, base: 'main' }, ctx(api)));
   assert.match(out, /edit_pull_request refused: base branch "main" is not in GITHUB_PR_BASE_ALLOW/);
   assert.equal(api.calls.length, 0);
-  // The pull request still points where it did.
   assert.equal((await api.getPullRequest({ repo: TEST_REPO, number: 8, kind: 'pull' })).base.ref, 'dev');
 });
 
@@ -310,7 +293,6 @@ test('with several repositories, the base allow-list is read per repository', as
   const second = { owner: TEST_REPO.owner, name: 'chronicle' };
   const two = ctx(api, {
     repos: [TEST_REPO, second],
-    // rayforce merges into dev, everything else into main.
     prBaseAllow: ['anima-research/rayforce:dev', 'main'],
   });
   const create = (repo: string, base: string) =>
@@ -323,7 +305,6 @@ test('with several repositories, the base allow-list is read per repository', as
   assert.match(refused, /base branch "dev" is not in GITHUB_PR_BASE_ALLOW \(allowed on anima-research\/chronicle: main\)/);
   assert.equal(api.callsTo('createPullRequest').length, 3);
 
-  // And the repository itself can no longer be left out.
   const missing = failure(
     await prToolModule.call('create_pull_request', { head: 'fix', base: 'main', title: 'Fix' }, two),
   );
@@ -355,10 +336,6 @@ test('a GitHub error from a pull-request write carries its status', async () => 
 });
 
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Echoed arguments are bounded
-// ─────────────────────────────────────────────────────────────────────────────
-
 test('a refused base branch is echoed bounded', async () => {
   const api = new FakeGitHubApi();
   const out = failure(
@@ -382,7 +359,6 @@ test('request_review bounds the logins it confirms, in count and in length', asy
   assert.match(out, new RegExp(`… 4 more not shown \\(list bound ${LIMITS.listEntries}\\)`));
   assert.ok(!out.includes('reviewer-50'), 'the 51st login is not echoed');
   assert.ok(out.length < LIMITS.listEntries * (LIMITS.titleChars + 2) + 200, `confirmation is ${out.length} chars`);
-  // The request itself is untouched by the rendering bound: all 54 were asked.
   assert.deepEqual(api.callsTo('requestReviewers')[0].args, [PULL, logins]);
 });
 

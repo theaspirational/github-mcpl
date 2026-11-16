@@ -1,24 +1,4 @@
 #!/usr/bin/env node
-/**
- * The one automated check on {@link ../e2e/fake-host.mjs}'s own behaviour.
- *
- * `npm test` covers `src/`; the end-to-end host is a script and nothing in the
- * suite would catch a regression in it. Three review rounds found three
- * separate ways it reported a green run over a server that had failed — a
- * refusal taken for a success (round 2), a crash between commands (round 3
- * finding 3), and a server that crashed *during* its own shutdown (round 3
- * finding 2) — so the lifecycle it has to get right is checked here instead.
- *
- * It needs no credentials and no network: each case spawns the host against a
- * tiny stub server written to a temp directory, which answers the MCPL
- * handshake and then behaves badly in one specific way. What is asserted is
- * the host's **exit status** and the verdict on its `child-exit` line, because
- * those are what a scenario run is read by.
- *
- *   node scripts/e2e/host-lifecycle-check.mjs
- *
- * Exits 0 when every case holds, 1 on the first that does not, naming it.
- */
 
 import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -27,15 +7,8 @@ import * as path from 'node:path';
 
 const HOST = path.join(import.meta.dirname, 'fake-host.mjs');
 const workspace = mkdtempSync(path.join(tmpdir(), 'github-mcpl-host-check-'));
+const IDLE_BEFORE_INPUT_MS = 400;
 
-/**
- * A stub server, parameterised by how it misbehaves.
- *
- * `onSigterm`: `'clean'` exits 0, `'fail'` exits 3, `'ignore'` does nothing at
- * all so the host has to escalate, and `'default'` installs no handler so the
- * signal itself ends the process. `crashWhenIdle` exits 3 shortly after the
- * grant, with no command in flight.
- */
 function stub(name, { onSigterm = 'clean', crashWhenIdle = false } = {}) {
   // fake-host invokes .js entries through Node; other suffixes are executables.
   const file = path.join(workspace, `${name}.js`);
@@ -64,19 +37,10 @@ setInterval(() => {}, 1000);
   return file;
 }
 
-/**
- * Run the host against `server`, closing its stdin the way `closing` says.
- *
- * `quit` sends the command; `eof` just closes the pipe. Either way the input
- * is delayed, so the stub has a window to misbehave while the host sits idle
- * on stdin with nothing in flight — which is the state round 3's finding 3
- * was about and which a command sent immediately would hide.
- */
 function run(server, closing, extra = []) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [HOST, '--server', server, '--shutdown-grace', '700', ...extra], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      // No credentials: the stub needs none, and this check must not read any.
       env: { PATH: process.env.PATH },
     });
     let out = '';
@@ -87,7 +51,7 @@ function run(server, closing, extra = []) {
     setTimeout(() => {
       if (closing === 'quit') child.stdin.write('{"cmd":"quit"}\n');
       child.stdin.end();
-    }, 400);
+    }, IDLE_BEFORE_INPUT_MS);
     child.on('exit', (code) => {
       const lines = out
         .split('\n')
@@ -166,7 +130,6 @@ try {
     if (testCase.expected !== undefined && got.childExit?.expected !== testCase.expected) {
       problems.push(`child-exit.expected ${got.childExit?.expected}, wanted ${testCase.expected}`);
     }
-    // A failing run has to say why, or the status is the only evidence there is.
     if (testCase.exit === 1 && got.failures.length === 0) problems.push('exit 1 with no failed result reported');
     if (testCase.exit === 0 && got.failures.length > 0) {
       problems.push(`exit 0 but ${got.failures.length} failed result(s)`);

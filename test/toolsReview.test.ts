@@ -1,15 +1,3 @@
-/**
- * github.review (TASK-SRHKG.1.6).
- *
- * Three things are load-bearing here and each is asserted directly:
- *
- *   - the inline comments reach GitHubApi.createReview with the exact
- *     positions the caller gave (path, line, side), in order;
- *   - an APPROVE or REQUEST_CHANGES on the bot's own pull request is refused
- *     by name, and refused before the review is submitted;
- *   - a malformed inline position is rejected rather than guessed at.
- */
-
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import { ToolArgumentError } from '../src/tool-support.js';
@@ -27,12 +15,14 @@ import {
 } from '../src/types.js';
 import { FakeGitHubApi, TEST_BOT, TEST_REPO } from './harness.js';
 
+const NO_CHECKPOINT_STORE = undefined as unknown as StateStore;
+
 function ctx(api: FakeGitHubApi, over: Partial<ToolContext> = {}): ToolContext {
   return {
     api,
-    // github.review is not rollback-capable (a submitted review cannot be
-    // withdrawn), so it never touches the checkpoint store.
-    state: undefined as unknown as StateStore,
+    // A submitted GitHub review can't be withdrawn, so github.review keeps no
+    // checkpoints.
+    state: NO_CHECKPOINT_STORE,
     botLogin: TEST_BOT.login,
     repos: [TEST_REPO],
     prBaseAllow: ['dev'],
@@ -71,10 +61,6 @@ test('the module declares github.review and its three tools', () => {
   ]);
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// create_review
-// ─────────────────────────────────────────────────────────────────────────────
-
 test('create_review submits the inline comments with the exact positions', async () => {
   const api = new FakeGitHubApi();
   api.seedPullRequest({ number: 8, author: HUMAN });
@@ -100,7 +86,6 @@ test('create_review submits the inline comments with the exact positions', async
   } satisfies CreateReviewInput);
   assert.match(out, /submitted commented review \d+ on anima-research\/rayforce#8 with 2 inline comments/);
 
-  // The fake opened one review thread per inline comment, at those positions.
   const threads = await api.listReviewThreads(PULL);
   assert.deepEqual(
     threads.map((t) => `${t.path}:${t.line}:${t.side}`),
@@ -192,7 +177,6 @@ test('a COMMENT review on the bot’s own pull request is allowed and costs no e
   api.seedPullRequest({ number: 8, author: { login: TEST_BOT.login, isBot: true } });
 
   ok(await reviewToolModule.call('create_review', { number: 8, event: 'COMMENT', body: 'note to self' }, ctx(api)));
-  // No getPullRequest: only a verdict needs to know who the author is.
   assert.deepEqual(api.callLog(), ['createReview']);
 });
 
@@ -239,10 +223,6 @@ test('a review on a repository outside GITHUB_REPOS is refused by name', async (
   assert.equal(api.calls.length, 0);
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Inline comment positions
-// ─────────────────────────────────────────────────────────────────────────────
-
 test('an inline comment position is validated, never guessed', async () => {
   const api = new FakeGitHubApi();
   api.seedPullRequest({ number: 8, author: HUMAN });
@@ -260,7 +240,7 @@ test('an inline comment position is validated, never guessed', async () => {
   assert.match(failure(await review([{ path: 'a.rs', line: 0, body: 'x' }])), /\.line" must be a positive integer/);
   assert.match(failure(await review([{ path: 'a.rs', line: -3, body: 'x' }])), /\.line" must be a positive integer/);
   assert.match(failure(await review([{ path: 'a.rs', line: 2.5, body: 'x' }])), /\.line" must be a positive integer/);
-  // A line number as a string is not a line number: GitHub would 422 on it.
+  // GitHub answers a line given as a string with a 422.
   assert.match(failure(await review([{ path: 'a.rs', line: '42', body: 'x' }])), /got "42"/);
   assert.match(
     failure(await review([{ path: 'a.rs', line: 42, side: 'BOTH', body: 'x' }])),
@@ -284,17 +264,11 @@ test('parseReviewComments is exact and total', () => {
   assert.throws(() => parseReviewComments([{ path: 'a.rs', line: 1, body: '' }]), ToolArgumentError);
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// resolve_thread / unresolve_thread
-// ─────────────────────────────────────────────────────────────────────────────
-
 test('resolve_thread and unresolve_thread move a thread of the named pull request', async () => {
   const api = new FakeGitHubApi();
   api.seedPullRequest({ number: 8, author: HUMAN });
   api.seedReviewThread(PULL, { id: 'RT_kwDO', isResolved: false });
 
-  // `repo` omitted: the single allowed repository is the one membership is
-  // established in.
   const resolved = ok(await reviewToolModule.call('resolve_thread', { number: 8, threadId: 'RT_kwDO' }, ctx(api)));
   assert.equal(resolved, 'resolved review thread RT_kwDO on anima-research/rayforce#8');
   assert.deepEqual(api.callLog(), ['listReviewThreads', 'resolveReviewThread']);
@@ -328,8 +302,8 @@ test('resolve_thread refuses a node id that is not on the pull request', async (
   const api = new FakeGitHubApi();
   api.seedPullRequest({ number: 8, author: HUMAN });
   api.seedReviewThread(PULL, { id: 'RT_ours', isResolved: false });
-  // A thread in a repository the allow-list does not cover. Its node id names
-  // no repository, so the only thing that can refuse it is membership.
+  // A review thread's GraphQL node id names no repository, so only the pull
+  // request's own thread list can refuse a foreign thread.
   const foreignPull: ThreadRef = { repo: OTHER_REPO, number: 8, kind: 'pull' };
   api.seedPullRequest({ repo: OTHER_REPO, number: 8 });
   api.seedReviewThread(foreignPull, { id: 'RT_foreign', isResolved: false });
@@ -339,7 +313,6 @@ test('resolve_thread refuses a node id that is not on the pull request', async (
     out,
     /resolve_thread refused: review thread "RT_foreign" is not one of the 1 review thread on anima-research\/rayforce#8/,
   );
-  // Nothing was mutated: not the foreign thread, not the allowed one.
   assert.deepEqual(api.callLog(), ['listReviewThreads']);
   assert.equal(api.callsTo('resolveReviewThread').length, 0);
   assert.equal((await api.listReviewThreads(foreignPull))[0].isResolved, false);
@@ -372,8 +345,6 @@ test('a thread id on another pull request of the allowed repository is refused',
 
 test('resolve_thread needs the pull request, a thread id, and rejects the channel thread id', async () => {
   const api = new FakeGitHubApi();
-  // The pull request is required: without it there is nothing to establish
-  // membership against.
   assert.match(
     failure(await reviewToolModule.call('resolve_thread', { threadId: 'RT_x' }, ctx(api))),
     /"number" must be a positive integer, got undefined/,
@@ -382,7 +353,6 @@ test('resolve_thread needs the pull request, a thread id, and rejects the channe
     failure(await reviewToolModule.call('resolve_thread', { number: 8 }, ctx(api))),
     /"threadId" is required and must be a non-empty string/,
   );
-  // `rt:<comment id>` addresses a channel thread, not the GraphQL node.
   assert.match(
     failure(await reviewToolModule.call('resolve_thread', { number: 8, threadId: 'rt:1001' }, ctx(api))),
     /"threadId" is the review thread id from list_review_threads \(a GraphQL node id\), not the channel thread id "rt:1001"/,
@@ -424,8 +394,6 @@ test('the input schemas advertise what the runtime enforces', () => {
   const comments = byName.get('create_review')!.inputSchema.properties.comments as {
     items: { properties: Record<string, Record<string, unknown>>; required: string[] };
   };
-  // A line is an integer ≥ 1, not any number: a host that validates the schema
-  // refuses 2.5 and "42" before the call, as parseReviewComments does after.
   assert.equal(comments.items.properties.line.type, 'integer');
   assert.equal(comments.items.properties.line.minimum, 1);
   assert.deepEqual(comments.items.properties.side.enum, ['LEFT', 'RIGHT']);
@@ -434,7 +402,6 @@ test('the input schemas advertise what the runtime enforces', () => {
 
   for (const name of ['resolve_thread', 'unresolve_thread']) {
     const schema = byName.get(name)!.inputSchema;
-    // The pull request is part of the contract of these tools now.
     assert.deepEqual(schema.required, ['number', 'threadId']);
     assert.equal((schema.properties.number as Record<string, unknown>).type, 'integer');
     assert.equal((schema.properties.number as Record<string, unknown>).minimum, 1);

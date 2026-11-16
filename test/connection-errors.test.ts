@@ -14,7 +14,6 @@ function capturingLogger(): Logger & { lines: string[] } {
   return { lines, debug: push('debug'), info: push('info'), warn: push('warn'), error: push('error') };
 }
 
-/** A server serving one connection whose host side is written as raw lines, so a frame reaches the server's reader byte for byte. */
 function rawHost() {
   const toServer = new PassThrough();
   const toHost = new PassThrough();

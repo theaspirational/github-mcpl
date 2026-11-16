@@ -1,14 +1,3 @@
-/**
- * content.ts — a render test for every `NormalizedEventKind`, the documented
- * bounds (4k body, 40-line diff hunk, 50-entry list, 80-char title), Markdown
- * and sticky-marker passthrough, and the promise that no raw payload field
- * reaches a block.
- *
- * Long bodies are one repeated character (`FILL`), so "no rendered body
- * exceeds 4000 chars" can be asserted directly on the output: the longest run
- * of that character in a block is the longest body the renderer let through.
- */
-
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import {
@@ -43,11 +32,9 @@ const ISSUE: ThreadRef = { repo: REPO, number: 7, kind: 'issue' };
 const PULL: ThreadRef = { repo: REPO, number: 12, kind: 'pull' };
 const URL = 'https://github.com/anima-research/rayforce/issues/7';
 
-/** One repeated character, so the longest run of it is the longest body shown. */
 const FILL = 'z';
 const HUGE_BODY = FILL.repeat(10_000);
 
-/** The one text block a renderer returns. */
 function only(blocks: ReturnType<typeof renderEvent>): string {
   assert.equal(blocks.length, 1);
   const block = blocks[0];
@@ -56,7 +43,6 @@ function only(blocks: ReturnType<typeof renderEvent>): string {
   return (block as { text: string }).text;
 }
 
-/** The longest run of `FILL` in the text — the longest body that got through. */
 function longestBody(text: string): number {
   return (text.match(new RegExp(`${FILL}+`, 'g')) ?? []).reduce(
     (max, run) => Math.max(max, run.length),
@@ -81,16 +67,6 @@ function event(
   };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// renderEvent: one row, and one test, per NormalizedEventKind
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * The payload each kind carries, the way the ingress (.3) fills it in. Kept
- * here rather than imported from tags.test.ts so neither test file runs the
- * other's cases; the coverage test below is what keeps both tables in step
- * with `NORMALIZED_EVENT_KINDS`.
- */
 const RENDER_TABLE: Array<{ kind: NormalizedEvent['kind']; event?: Partial<NormalizedEvent> }> = [
   { kind: 'issue.opened', event: { title: 'Rate limiter drops bursts', body: 'Repro inside.' } },
   { kind: 'issue.edited', event: { title: 'Rate limiter drops bursts', body: 'Clarified.' } },
@@ -162,8 +138,6 @@ for (const row of RENDER_TABLE) {
     const text = only(renderEvent(ev));
     const header = text.split('\n')[0];
 
-    // The header line: repo#number (or repo, for a threadless event), kind,
-    // actor, link.
     if (ev.thread) assert.ok(header.startsWith(`anima-research/rayforce#${ev.thread.number} `), header);
     else assert.ok(header.startsWith('anima-research/rayforce '), header);
     assert.ok(header.includes(row.kind), header);
@@ -199,10 +173,6 @@ test('an event that carries no body renders no body section', () => {
   assert.ok(!text.includes('(no body)'));
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Bounds
-// ─────────────────────────────────────────────────────────────────────────────
-
 test('an event body is bounded to LIMITS.commentChars with a note', () => {
   const text = only(renderEvent(event('issue.opened', { body: HUGE_BODY })));
   assert.ok(longestBody(text) <= LIMITS.commentChars);
@@ -224,7 +194,6 @@ test('a diff hunk is bounded to 40 lines with a note', () => {
   const hunk = Array.from({ length: 200 }, (_, i) => `+line ${i}`).join('\n');
   const bounded = boundedDiffHunk(hunk);
   const lines = bounded.split('\n');
-  // 40 kept lines plus the one-line note.
   assert.equal(lines.length, CONTENT_LIMITS.diffHunkLines + 1);
   assert.ok(lines[lines.length - 1].includes('160 lines dropped'), lines[lines.length - 1]);
   assert.ok(!bounded.includes('+line 40'));
@@ -264,10 +233,6 @@ test('a review comment with no line number renders path:?', () => {
   assert.ok(text.includes('README.md:?'), text);
   assert.ok(!text.includes('```diff'), 'an empty hunk renders no fence');
 });
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Passthrough and leak guards
-// ─────────────────────────────────────────────────────────────────────────────
 
 test('Markdown and HTML comments (sticky markers) pass through verbatim', () => {
   const body = [
@@ -311,8 +276,6 @@ test('a body is rendered byte for byte: indentation, tabs and trailing spaces su
   ];
   for (const [name, text] of rendered) {
     assert.ok(text.includes(raw), `${name} altered the body`);
-    // The body is last in every block, so an exact tail is an exact body: a
-    // stripped indent or a swallowed trailing space fails here.
     assert.ok(text.endsWith(raw), `${name} did not end with the body verbatim`);
   }
 });
@@ -322,7 +285,6 @@ test('only an all-whitespace body counts as empty', () => {
     const text = only(renderEvent(event('comment.created', { body: blank })));
     assert.ok(text.endsWith('(no body)'), JSON.stringify(blank));
   }
-  // Whitespace *around* content is content, and is kept.
   const padded = '  \n  x  ';
   assert.ok(only(renderEvent(event('comment.created', { body: padded }))).endsWith(padded));
 });
@@ -345,10 +307,6 @@ test('no raw payload field reaches a rendered block', () => {
     assert.ok(!text.includes(secret), secret);
   }
 });
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Tool-result renderers
-// ─────────────────────────────────────────────────────────────────────────────
 
 function issue(over: Partial<Issue> = {}): Issue {
   return {
@@ -405,8 +363,6 @@ function comment(over: Partial<Comment> = {}): Comment {
 
 function reviewThread(over: Partial<ReviewThread> = {}): ReviewThread {
   return {
-    // The GraphQL node id resolve_thread/unresolve_thread take — deliberately
-    // unlike the `rt:901` reply id, so a test cannot pass on one by accident.
     id: 'PRRT_graphql_node_123',
     path: 'src/limiter.ts',
     line: 42,
@@ -519,9 +475,6 @@ test('renderReviewThreads shows path, side, resolution, both ids and bounds bodi
 });
 
 test('renderReviewThreads carries the GraphQL node id beside the rt: reply id', () => {
-  // Two different tools, two different ids: resolve_thread/unresolve_thread
-  // take ReviewThread.id (a GraphQL node id), reply_in_thread takes the
-  // channel thread id rt:<root comment id>. Dropping either strands the agent.
   const threads: ReviewThread[] = [
     reviewThread({ id: 'PRRT_kwDOAbCdEf4Axxxx', comments: [reviewComment({ id: 901 })] }),
     reviewThread({
@@ -610,10 +563,6 @@ test('renderPullRequestFiles lists names and stats only, capped', () => {
   assert.ok(!text.includes('@@'), 'no patch text');
   assert.ok(only(renderPullRequestFiles([])).includes('(no files)'));
 });
-
-// ─────────────────────────────────────────────────────────────────────────────
-// The bound holds for every kind, not just the ones with a body in the table
-// ─────────────────────────────────────────────────────────────────────────────
 
 test('no rendered event body exceeds LIMITS.commentChars, on any kind', () => {
   for (const kind of NORMALIZED_EVENT_KINDS) {

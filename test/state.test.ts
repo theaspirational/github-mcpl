@@ -1,11 +1,3 @@
-/**
- * state.ts — checkpoint lineage, rollback planning, and the atomic state file
- * (TASK-SRHKG.1.7).
- *
- * Every test works in its own temp directory; nothing here touches the network
- * or a real state file path.
- */
-
 import { strict as assert } from 'node:assert';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
@@ -21,7 +13,6 @@ function tempFile(name = 'state.json'): string {
   return join(mkdtempSync(join(tmpdir(), 'github-mcpl-state-')), name);
 }
 
-/** A Logger that keeps what it was told, so a test can assert on diagnostics. */
 function capturingLogger(): Logger & { lines: string[] } {
   const lines: string[] = [];
   const push = (level: string) => (message: string) => {
@@ -38,10 +29,6 @@ function strayTempFiles(file: string): string[] {
   const dir = join(file, '..');
   return readdirSync(dir).filter((n) => n.includes('.tmp-'));
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Checkpoint lineage (§8.2)
-// ─────────────────────────────────────────────────────────────────────────────
 
 test('checkpoints form a lineage, and a rollback branches it', async () => {
   const state = GithubState.empty();
@@ -61,7 +48,6 @@ test('checkpoints form a lineage, and a rollback branches it', async () => {
     ],
   );
 
-  // Rolling back moves `current` back; the next checkpoint branches from there.
   assert.ok(state.rollback(first.id));
   assert.equal(state.current(), first.id);
   const branch = state.createCheckpoint();
@@ -78,10 +64,6 @@ test('an unknown checkpoint plans nothing (the caller answers -32005)', () => {
   state.createCheckpoint();
   assert.equal(state.rollback('chk_nope'), null);
 });
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Rollback planning
-// ─────────────────────────────────────────────────────────────────────────────
 
 test('rollback plans the writes recorded after the checkpoint, newest first', () => {
   const state = GithubState.empty();
@@ -102,13 +84,9 @@ test('rollback plans the writes recorded after the checkpoint, newest first', ()
   assert.deepEqual(plan.edited.map((e) => [e.commentId, e.previousBody]), [[5, 'before']]);
   assert.deepEqual(plan.deleted.map((d) => d.commentId), [6]);
 
-  // The buckets are consumed: a second rollback to the same checkpoint is a
-  // no-op, not a double undo.
   const again = state.rollback(base.id);
   assert.ok(again);
   assert.deepEqual(again, { created: [], edited: [], deleted: [] });
-  // The checkpoints the first rollback left behind are no longer rollable:
-  // their undo records are spent and nothing can rebuild the state they named.
   assert.equal(state.checkpointStatus(afterFirst.id), 'abandoned');
   assert.equal(state.rollback(afterFirst.id), null);
 });
@@ -133,13 +111,8 @@ test('two edits of one comment restore the oldest body last', () => {
 
   const plan = state.rollback(base.id);
   assert.ok(plan);
-  // Applied in order, the last write wins, so the oldest body is the one left.
   assert.deepEqual(plan.edited.map((e) => e.previousBody), ['second', 'first']);
 });
-
-// ─────────────────────────────────────────────────────────────────────────────
-// The state file
-// ─────────────────────────────────────────────────────────────────────────────
 
 test('flush writes a versioned state file atomically and leaves no temp file', async () => {
   const file = tempFile();
@@ -155,7 +128,6 @@ test('flush writes a versioned state file atomically and leaves no temp file', a
   assert.deepEqual(written.created[cp.id].map((c) => c.commentId), [11]);
   assert.equal(written.lastPollAt, '2026-10-14T00:00:00.000Z');
   assert.deepEqual(strayTempFiles(file), []);
-  // The file holds this server's bookkeeping; no group or other access.
   assert.equal(statSync(file).mode & 0o077, 0);
 });
 
@@ -233,9 +205,9 @@ test('a damaged or foreign state file starts empty with one stderr line', () => 
   assert.deepEqual(GithubState.load(future, futureLog).lineage(), []);
   assert.match(futureLog.lines[0], /not a version 1 snapshot/);
 
-  // An absent file is the normal first start: no diagnostics at all.
   const fresh = capturingLogger();
-  assert.deepEqual(GithubState.load(tempFile(), fresh).lineage(), []);
+  const absent = tempFile();
+  assert.deepEqual(GithubState.load(absent, fresh).lineage(), []);
   assert.deepEqual(fresh.lines, []);
 });
 
@@ -248,10 +220,6 @@ test('without a state file the store works in memory and flush is a no-op', asyn
   assert.equal(state.current(), cp.id);
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Poll cursor and dedup ring (amendment 1)
-// ─────────────────────────────────────────────────────────────────────────────
-
 test('the poll dedup ring remembers the last 2000 keys and no more', () => {
   const state = GithubState.empty();
   assert.equal(state.lastPollAt(), null);
@@ -260,12 +228,12 @@ test('the poll dedup ring remembers the last 2000 keys and no more', () => {
 
   assert.equal(state.seenPollKey('comment:1:t0'), false);
   assert.equal(state.seenPollKey('comment:1:t0'), true);
-  // A new updated_at is a new key: an edit of the same comment is not a replay.
+  // GitHub stamps an edit with a new updated_at, to the second, so an edit
+  // in a later second has a new key and isn't a replay.
   assert.equal(state.seenPollKey('comment:1:t1'), false);
 
   for (let i = 0; i < POLL_DEDUP_RING; i++) state.seenPollKey(`issue:${i}:t`);
   assert.equal(state.snapshot().pollKeys.length, POLL_DEDUP_RING);
-  // The oldest keys fell out of the ring, the newest are still there.
   assert.equal(state.seenPollKey('comment:1:t0'), false);
   assert.equal(state.seenPollKey(`issue:${POLL_DEDUP_RING - 1}:t`), true);
 });
@@ -275,19 +243,14 @@ test('the polled heads are bounded, oldest out first, and re-recording a head re
   assert.equal(state.polledHead('github:anima-research/rayforce#58'), null);
   state.setPolledHead('github:anima-research/rayforce#58', 'a'.repeat(40));
   assert.equal(state.polledHead('github:anima-research/rayforce#58'), 'a'.repeat(40));
-  // Last write wins: this is "the head the last pass saw", not a history.
   state.setPolledHead('github:anima-research/rayforce#58', 'b'.repeat(40));
   assert.equal(state.polledHead('github:anima-research/rayforce#58'), 'b'.repeat(40));
 
-  // Bounded, and the *oldest* entry is the one that goes.
   for (let i = 0; i < POLL_HEAD_MEMORY; i++) state.setPolledHead(`github:${REPO}#${1000 + i}`, 'c'.repeat(40));
   assert.equal(Object.keys(state.snapshot().pollHeads).length, POLL_HEAD_MEMORY);
   assert.equal(state.polledHead('github:anima-research/rayforce#58'), null);
   assert.equal(state.polledHead(`github:${REPO}#${1000 + POLL_HEAD_MEMORY - 1}`), 'c'.repeat(40));
 
-  // Re-recording an unchanged head refreshes its place in the eviction order,
-  // so a pull request polled every minute is not evicted ahead of heads
-  // nobody has looked at since.
   const oldest = `github:${REPO}#1000`;
   state.setPolledHead(oldest, 'c'.repeat(40));
   state.setPolledHead(`github:${REPO}#9999`, 'd'.repeat(40));
@@ -297,8 +260,6 @@ test('the polled heads are bounded, oldest out first, and re-recording a head re
 
 test('a state file written before amendment 2a still loads, with no heads known', () => {
   const file = tempFile();
-  // A version-1 snapshot from before `pollHeads` existed: the field is
-  // additive, so this is still a valid file and not a damaged one.
   writeFileSync(
     file,
     JSON.stringify({
@@ -314,11 +275,9 @@ test('a state file written before amendment 2a still loads, with no heads known'
   );
   const log = capturingLogger();
   const state = GithubState.load(file, log);
-  // Loaded, not reset: the cursor and the ring are the ones on disk.
   assert.equal(state.lastPollAt(), '2026-10-14T00:00:00.000Z');
   assert.equal(state.seenPollKey('issue:1:t0'), true);
   assert.deepEqual(state.snapshot().pollHeads, {});
-  // Nor per-list cursors, so every list starts from `lastPollAt`.
   assert.deepEqual(state.pollCursors(), {});
   assert.deepEqual(state.polledNew(), {});
   assert.deepEqual(log.lines, []);
@@ -400,7 +359,6 @@ test('a polled head round-trips through a flush (amendment 2a)', async () => {
 
   const reloaded = GithubState.load(file, capturingLogger());
   assert.equal(reloaded.polledHead('github:anima-research/rayforce#58'), 'e'.repeat(40));
-  // A non-string value in the file is dropped rather than trusted.
   const raw = readSnapshot(file) as unknown as { pollHeads: Record<string, unknown> };
   raw.pollHeads['github:anima-research/rayforce#59'] = 42;
   writeFileSync(file, JSON.stringify(raw));
@@ -419,13 +377,9 @@ test('a checkpoint abandoned by an earlier rollback is refused, not accepted emp
   assert.equal(state.checkpointStatus(b.id), 'live');
   assert.ok(state.rollback(a.id));
 
-  // The rollback spent A's records and moved off B's branch. B named a state
-  // this server can no longer rebuild, so it stops being rollable — answering
-  // it with an empty plan would report a restoration that never happened.
   state.recordEditedComment({ repo: REPO, commentId: 5, previousBody: 'A', review: false });
   assert.equal(state.checkpointStatus(b.id), 'abandoned');
   assert.equal(state.rollback(b.id), null);
-  // A itself stays live: it is still the current lineage.
   assert.equal(state.checkpointStatus(a.id), 'live');
   assert.ok(state.rollback(a.id));
   assert.equal(state.checkpointStatus('chk_never'), 'unknown');

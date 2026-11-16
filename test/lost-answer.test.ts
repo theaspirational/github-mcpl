@@ -31,8 +31,6 @@ writeFileSync(
 
 type Answer = { status: number; body?: unknown } | 'lost';
 
-// 'lost' keeps the whole request and closes the socket without answering, as
-// a connection that drops after GitHub stored a write does.
 class FakeGitHub {
   readonly received: { method: string; path: string; body: string }[] = [];
   private readonly answers = new Map<string, Answer>([
